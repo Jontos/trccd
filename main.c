@@ -107,14 +107,14 @@ static int keep_alive(libusb_device_handle *dev)
 {
     unsigned char nothing[PACKET_SIZE] = {0};
 
-    struct timespec sleep_3_sec = {
-        .tv_nsec = 0,
-        .tv_sec = 3
+    struct timespec sleep_duration = {
+        .tv_nsec = 500000000,
+        .tv_sec = 2
     };
 
     while (keep_running) {
         if (usb_send_data(nothing, PACKET_SIZE, dev) < 0) return 1;
-        nanosleep(&sleep_3_sec, NULL);
+        nanosleep(&sleep_duration, NULL);
     }
 
     return 0;
