@@ -150,9 +150,11 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
         return proc_pipe;
     }
 
-    const char vf_format_str[] = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,transpose=1";
+    const char *vf_format_str = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,transpose=1";
+    const char *framerate_filter = ",fps=22";
     char vf_str[256];
-    (void)snprintf(vf_str, sizeof(vf_str), vf_format_str, LCD_WIDTH, LCD_HEIGHT, LCD_WIDTH, LCD_HEIGHT);
+    int n_write = snprintf(vf_str, sizeof(vf_str), vf_format_str, LCD_WIDTH, LCD_HEIGHT, LCD_WIDTH, LCD_HEIGHT);
+    if (mode == VIDEO) strncat(vf_str, framerate_filter, sizeof(vf_str) - n_write);
 
     char *args[][32] = {
         [VIDEO] = {
@@ -163,7 +165,6 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
             "-vf", vf_str,
             "-f", "rawvideo",
             "-pix_fmt", "rgb565le",
-            "-r", "22",
             "-", NULL
         },
         [IMAGE] = {
