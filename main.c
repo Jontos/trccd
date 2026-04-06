@@ -235,7 +235,14 @@ static void close_process_pipe(struct process_pipe *proc_pipe)
     }
 
     if (proc_pipe->child_pid > 0) {
-        waitpid(proc_pipe->child_pid, NULL, 0);
+        int status;
+        waitpid(proc_pipe->child_pid, &status, 0);
+        if (WIFEXITED(status)) {
+            int exit_code = WEXITSTATUS(status);
+            if (exit_code) {
+                (void)fprintf(stderr, "Ffmpeg failed with error code: %d\n", exit_code);
+            }
+        }
         proc_pipe->child_pid = -1;
     }
 }
@@ -295,6 +302,12 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
         }
     }
     close_process_pipe(&proc_pipe);
+
+    if (num_frames == 0) {
+        (void)fprintf(stderr, "Error: No frames were read from the video stream.\n");
+        free(video_buffer);
+        return 1;
+    }
 
     size_t current_frame = 0;
     while (keep_running) {
