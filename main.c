@@ -41,10 +41,14 @@ static void sig_handler(int signum)
 
 static libusb_device_handle *usb_init()
 {
-    libusb_init_context(NULL, NULL, 0);
+    int ret = libusb_init_context(NULL, NULL, 0);
+    if (ret < 0) {
+        (void)fprintf(stderr, "Failed to initialise libusb: %s\n", libusb_error_name(ret));
+        return NULL;
+    }
     libusb_device_handle *dev = libusb_open_device_with_vid_pid(NULL, VID, PID);
     if (!dev) {
-        (void)fprintf(stderr, "[-] Warning: Device not found.\n");
+        (void)fprintf(stderr, "Warning: Device not found.\n");
         return NULL;
     }
 
