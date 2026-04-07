@@ -361,7 +361,8 @@ int main(int argc, const char **argv)
     commands[] = {
         {"image", IMAGE},
         {"colour", COLOUR},
-        {"video", VIDEO}
+        {"color", COLOUR},
+        {"video", VIDEO},
         {"help", PRINT_USAGE}
     };
 
