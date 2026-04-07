@@ -1,0 +1,2 @@
+# Winbond USBDISPLAY
+SUBSYSTEM=="usb", ATTR{idVendor}=="0416", ATTR{idProduct}=="5302", GROUP="tr_display", MODE="0664"

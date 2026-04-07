@@ -6,6 +6,7 @@ prefix ?= /usr/local
 exec_prefix ?= $(prefix)
 bindir ?= $(exec_prefix)/bin
 libdir ?= $(exec_prefix)/lib
+sysconfdir ?= $(prefix)/etc
 
 EXTRA_CFLAGS = -std=gnu23 -Wall -Wextra
 CFLAGS = -O2 $(EXTRA_CFLAGS)
@@ -27,8 +28,9 @@ install: $(target)
 	install -Dm755 $(target) $(DESTDIR)$(bindir)/$(target)
 
 	install -Dm644 trccd.service $(DESTDIR)$(libdir)/systemd/system/trccd.service
-	install -Dm644 99-trccd.rules $(DESTDIR)$(libdir)/udev/rules.d/99-trccd.rules
+	install -Dm644 trccd.rules $(DESTDIR)$(libdir)/udev/rules.d/99-trccd.rules
 	install -Dm644 trccd.sysusers $(DESTDIR)$(libdir)/sysusers.d/trccd.conf
+	install -Dm644 trccd.conf $(DESTDIR)$(sysconfdir)/trccd/trccd.conf
 
 clean:
 	rm $(target) $(objects)

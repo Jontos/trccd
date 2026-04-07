@@ -1,0 +1,58 @@
+[Unit]
+Description=Lightweight daemon for Thermalright LCD control
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/trccd $TRCCD_MODE $TRCCD_FILE
+
+## Systemd hardening, see systemd.exec(5)
+; Paths
+ProtectProc=invisible
+ProcSubset=pid
+
+; User/group identity
+DynamicUser=yes
+SupplementaryGroups=tr_display
+
+; Capabilities
+CapabilityBoundingSet=
+
+; Process properties
+UMask=066
+
+; Sandboxing
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+PrivateIPC=yes
+PrivateUsers=self
+ProtectHostname=yes
+ProtectClock=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=strict
+RestrictAddressFamilies=AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+
+; System call filtering
+SystemCallFilter=@system-service
+SystemCallArchitectures=native
+
+; Environment
+EnvironmentFile=/etc/trccd/trccd.conf
+
+## systemd.resource-control(5)
+; Network control
+IPAddressDeny=any
+
+; Device access
+DeviceAllow=char-usb_device rw
+DevicePolicy=closed
+
+
+[Install]
+WantedBy=multi-user.target
