@@ -24,6 +24,7 @@
 
 enum mode {
     NOTHING,
+    PRINT_USAGE,
     COLOUR,
     IMAGE,
     VIDEO
@@ -321,6 +322,22 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
     return 0;
 }
 
+static void print_usage(FILE *stream, const char *argv0)
+{
+    (void)fprintf(
+        stream, 
+        "Usage:\n"
+        "\t%s <mode> [arg]\n"
+        "Stream media to Thermalright LCD display.\n\n"
+        "Modes:\n"
+        "\tvideo\tStream video bytes from [arg] to screen. Will read from stdin if no [arg] supplied.\n"
+        "\timage\tDisplay static image from [arg] on screen. Will read from stdin if no [arg] supplied.\n"
+        "\tcolour\tDisplay solid colour on screen, [arg] must be a RGB565 colour in hex format.\n"
+        "\thelp\tDisplay this message.\n",
+        argv0
+    );
+}
+
 int main(int argc, const char **argv)
 {
     struct sigaction signal = {
@@ -345,6 +362,7 @@ int main(int argc, const char **argv)
         {"image", IMAGE},
         {"colour", COLOUR},
         {"video", VIDEO}
+        {"help", PRINT_USAGE}
     };
 
     if (argc > 1) {
@@ -357,11 +375,13 @@ int main(int argc, const char **argv)
         }
     }
 
+    libusb_device_handle *device = NULL;
+    if (do_what > 1) {
+        device = usb_init();
+        if (!device) return 1;
+    }
+
     int ret = 0;
-
-    libusb_device_handle *device = usb_init();
-    if (!device) return 1;
-
     switch (do_what) {
         case IMAGE:
             ret = display_image(argv[2], device);
@@ -371,7 +391,7 @@ int main(int argc, const char **argv)
                 ret = print_colour(strtoul(argv[2], NULL, 16), device);
             }
             else {
-                (void)fprintf(stderr, "Provide colour e.g. 0x07E0\n");
+                print_usage(stderr, argv[0]);
                 ret = 1;
             }
             break;
@@ -379,6 +399,11 @@ int main(int argc, const char **argv)
             ret = display_video(argv[2], device);
             break;
         case NOTHING:
+            print_usage(stderr, argv[0]);
+            return 1;
+        case PRINT_USAGE:
+            print_usage(stdout, argv[0]);
+            return 0;
     }
 
     usb_release(device);
