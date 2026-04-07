@@ -41,15 +41,15 @@ static void sig_handler(int signum)
 
 static libusb_device_handle *usb_init()
 {
-    int ret = libusb_init_context(NULL, NULL, 0);
+    int ret = libusb_init_context(nullptr, nullptr, 0);
     if (ret < 0) {
         (void)fprintf(stderr, "Failed to initialise libusb: %s\n", libusb_error_name(ret));
-        return NULL;
+        return nullptr;
     }
-    libusb_device_handle *dev = libusb_open_device_with_vid_pid(NULL, VID, PID);
+    libusb_device_handle *dev = libusb_open_device_with_vid_pid(nullptr, VID, PID);
     if (!dev) {
         (void)fprintf(stderr, "Warning: Device not found.\n");
-        return NULL;
+        return nullptr;
     }
 
     libusb_set_auto_detach_kernel_driver(dev, 1);
@@ -57,8 +57,8 @@ static libusb_device_handle *usb_init()
     if (libusb_claim_interface(dev, 0) < 0) {
         (void)fprintf(stderr, "Warning: Could not claim interface.\n");
         libusb_close(dev);
-        libusb_exit(NULL);
-        return NULL;
+        libusb_exit(nullptr);
+        return nullptr;
     }
 
     return dev;
@@ -71,12 +71,12 @@ static void usb_release(libusb_device_handle *dev)
         (void)fprintf(stderr, "[-] Failed: %s\n", libusb_error_name(ret));
     }
     libusb_close(dev);
-    libusb_exit(NULL);
+    libusb_exit(nullptr);
 }
 
 static int usb_send_data(unsigned char *data, int length, libusb_device_handle *dev)
 {
-    int ret = libusb_interrupt_transfer(dev, EP_OUT, data, length, NULL, 5000);
+    int ret = libusb_interrupt_transfer(dev, EP_OUT, data, length, nullptr, 5000);
 
     if (ret < 0) {
         (void)fprintf(stderr, "[-] Failed: %s\n", libusb_error_name(ret));
@@ -119,7 +119,7 @@ static int keep_alive(libusb_device_handle *dev)
 
     while (keep_running) {
         if (usb_send_data(nothing, PACKET_SIZE, dev) < 0) return 1;
-        nanosleep(&sleep_duration, NULL);
+        nanosleep(&sleep_duration, nullptr);
     }
 
     return 0;
@@ -147,7 +147,7 @@ struct process_pipe {
 
 static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
 {
-    struct process_pipe proc_pipe = { .stream = NULL, .child_pid = -1 };
+    struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
     int fildes[2];
     if (pipe(fildes) < 0) {
@@ -170,7 +170,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
             "-vf", vf_str,
             "-f", "rawvideo",
             "-pix_fmt", "rgb565le",
-            "-", NULL
+            "-", nullptr
         },
         [IMAGE] = {
             "ffmpeg", "-nostdin",
@@ -180,7 +180,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
             "-f", "rawvideo",
             "-pix_fmt", "rgb565le",
             "-vframes", "1",
-            "-", NULL
+            "-", nullptr
         }
     };
 
@@ -204,7 +204,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
             if (!proc_pipe.stream) {
                 perror("Failed to open pipe for reading");
                 close(fildes[0]);
-                waitpid(pid, NULL, 0);
+                waitpid(pid, nullptr, 0);
                 break;
             }
             proc_pipe.child_pid = pid;
@@ -215,7 +215,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
 
 static struct process_pipe open_pipe(const char *path_arg, enum mode mode)
 {
-    struct process_pipe proc_pipe = { .stream = NULL, .child_pid = -1 };
+    struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
     if (path_arg) {
         proc_pipe = spawn_ffmpeg(path_arg, mode);
@@ -236,7 +236,7 @@ static void close_process_pipe(struct process_pipe *proc_pipe)
         if (fclose(proc_pipe->stream) == EOF) {
             perror("Failed to close pipe");
         }
-        proc_pipe->stream = NULL;
+        proc_pipe->stream = nullptr;
     }
 
     if (proc_pipe->child_pid > 0) {
@@ -350,8 +350,8 @@ int main(int argc, const char **argv)
     };
     sigemptyset(&signal.sa_mask);
 
-    if (sigaction(SIGINT, &signal, NULL) == -1 ||
-        sigaction(SIGTERM, &signal, NULL) == -1) {
+    if (sigaction(SIGINT, &signal, nullptr) == -1 ||
+        sigaction(SIGTERM, &signal, nullptr) == -1) {
         perror("sigaction");
         return 1;
     }
@@ -380,7 +380,7 @@ int main(int argc, const char **argv)
         }
     }
 
-    libusb_device_handle *device = NULL;
+    libusb_device_handle *device = nullptr;
     if (do_what > 1) {
         device = usb_init();
         if (!device) return 1;
@@ -393,7 +393,7 @@ int main(int argc, const char **argv)
             break;
         case COLOUR:
             if (argc == 3) {
-                ret = print_colour(strtoul(argv[2], NULL, 16), device);
+                ret = print_colour(strtoul(argv[2], nullptr, 16), device);
             }
             else {
                 print_usage(stderr, argv[0]);
