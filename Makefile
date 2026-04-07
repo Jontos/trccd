@@ -7,13 +7,15 @@ exec_prefix ?= $(prefix)
 bindir ?= $(exec_prefix)/bin
 libdir ?= $(exec_prefix)/lib
 
-CFLAGS = -O2
+EXTRA_CFLAGS = -std=gnu23 -Wall -Wextra
+CFLAGS = -O2 $(EXTRA_CFLAGS)
 LDLIBS = $(shell pkgconf --libs $(packages)) -lm 
 
-.PHONY: all clean
+.PHONY: all clean debug install
+
 all: $(target)
 
-debug: CFLAGS = -Og -g
+debug: CFLAGS = -Og -g $(EXTRA_CFLAGS)
 debug: $(target)
 
 $(target): $(objects)
