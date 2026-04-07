@@ -33,4 +33,4 @@ install: $(target)
 	install -Dm644 trccd.conf $(DESTDIR)$(sysconfdir)/trccd/trccd.conf
 
 clean:
-	rm $(target) $(objects)
+	rm -f $(target) $(objects)
