@@ -1,3 +1,4 @@
+#include <errno.h>
 #include <libusb-1.0/libusb.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -171,13 +172,25 @@ static int keep_alive(libusb_device_handle *dev)
     return 0;
 }
 
-static int print_colour(uint16_t colour, libusb_device_handle *dev)
+static int print_colour(const char *colour_str, libusb_device_handle *dev)
 {
+    errno = 0;
+    char *endptr;
+    unsigned long colour = strtoul(colour_str, &endptr, 16);
+    if (endptr == colour_str || *endptr != '\0') {
+        (void)fprintf(stderr, "Failed to parse colour\n");
+        return 1;
+    }
+    if (errno == ERANGE || colour > UINT16_MAX) {
+        (void)fprintf(stderr, "Colour value out of range!\n");
+        return 1;
+    }
+
     unsigned char buffer[FRAME_SIZE];
     uint16_t *buf_ptr = (uint16_t*)buffer;
     size_t count = FRAME_SIZE / sizeof(uint16_t);
     while (count--) {
-        *buf_ptr++ = colour;
+        *buf_ptr++ = (uint16_t)colour;
     }
 
     if (usb_send_header(dev) < 0 ||
@@ -445,7 +458,7 @@ int main(int argc, const char **argv)
             break;
         case COLOUR:
             if (argc == 3) {
-                ret = print_colour(strtoul(argv[2], nullptr, 16), device);
+                ret = print_colour(argv[2], device);
             }
             else {
                 print_usage(stderr, argv[0]);
