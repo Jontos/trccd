@@ -243,7 +243,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
             close(fildes[1]);
             execvp("ffmpeg", args[mode]);
             perror("Failed to exec ffmpeg");
-            exit(1);
+            _exit(1);
         default:
             close(fildes[1]);
             proc_pipe.stream = fdopen(fildes[0], "r");
