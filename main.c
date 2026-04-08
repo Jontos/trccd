@@ -435,7 +435,7 @@ int main(int argc, const char **argv)
     int ret = 0;
     switch (do_what) {
         case IMAGE:
-            ret = display_image(argv[2], device);
+            ret = display_image(argc >= 3 ? argv[2] : nullptr, device);
             break;
         case COLOUR:
             if (argc == 3) {
@@ -447,7 +447,7 @@ int main(int argc, const char **argv)
             }
             break;
         case VIDEO:
-            ret = display_video(argv[2], device);
+            ret = display_video(argc >= 3 ? argv[2] : nullptr, device);
             break;
         case NOTHING:
             print_usage(stderr, argv[0]);
