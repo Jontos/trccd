@@ -201,34 +201,40 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
         return proc_pipe;
     }
 
-    const char *vf_format_str = "scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d,transpose=1";
-    const char *framerate_filter = ",fps=22";
     char vf_str[256];
-    int n_write = snprintf(vf_str, sizeof(vf_str), vf_format_str, LCD_WIDTH, LCD_HEIGHT, LCD_WIDTH, LCD_HEIGHT);
-    if (mode == VIDEO) strncat(vf_str, framerate_filter, sizeof(vf_str) - n_write);
+    (void)snprintf(vf_str, sizeof(vf_str),
+                   "scale=%d:%d:force_original_aspect_ratio=increase,"
+                   "crop=%d:%d,transpose=1%s",
+                   LCD_WIDTH, LCD_HEIGHT,
+                   LCD_WIDTH, LCD_HEIGHT,
+                   mode == VIDEO ? ",fps=22" : "");
+    const char *args[32];
+    int idx = 0;
 
-    char *args[][32] = {
-        [VIDEO] = {
-            "ffmpeg", "-nostdin",
-            "-loglevel", "quiet",
-            "-i", (char*)filepath,
-            "-an", "-sn",
-            "-vf", vf_str,
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb565le",
-            "-", nullptr
-        },
-        [IMAGE] = {
-            "ffmpeg", "-nostdin",
-            "-loglevel", "quiet",
-            "-i", (char*)filepath,
-            "-vf", vf_str,
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb565le",
-            "-vframes", "1",
-            "-", nullptr
-        }
-    };
+    args[idx++] = "ffmpeg";
+    args[idx++] = "-nostdin";
+    args[idx++] = "-loglevel";
+    args[idx++] = "quiet";
+    args[idx++] = "-i";
+    args[idx++] = filepath;
+
+    if (mode == VIDEO) {
+        args[idx++] = "-an";
+        args[idx++] = "-sn";
+    }
+    else {
+        args[idx++] = "-vframes";
+        args[idx++] = "1";
+    }
+
+    args[idx++] = "-vf";
+    args[idx++] = vf_str;
+    args[idx++] = "-f";
+    args[idx++] = "rawvideo";
+    args[idx++] = "-pix_fmt";
+    args[idx++] = "rgb565le";
+    args[idx++] = "-";
+    args[idx++] = nullptr;
 
     pid_t pid = fork();
     switch (pid) {
@@ -241,7 +247,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
             close(fildes[0]);
             dup2(fildes[1], STDOUT_FILENO);
             close(fildes[1]);
-            execvp("ffmpeg", args[mode]);
+            execvp(args[0], (char *const *)args);
             perror("Failed to exec ffmpeg");
             _exit(1);
         default:
