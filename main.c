@@ -14,6 +14,7 @@
 constexpr uint16_t VID = 0x0416;
 constexpr uint16_t PID = 0x5302;
 constexpr unsigned char EP_OUT = 0x02;
+constexpr int DISPLAY_INTERFACE = 0;
 
 constexpr int LCD_WIDTH = 320;
 constexpr int LCD_HEIGHT = 240;
@@ -39,29 +40,74 @@ static void sig_handler(int signum)
     }
 }
 
+static libusb_device_handle *usb_open_device()
+{
+    int ret;
+    struct libusb_device **list;
+    ssize_t num_devices = libusb_get_device_list(nullptr, &list);
+    if (num_devices < 0) {
+        ret = (int)num_devices;
+        (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+        return nullptr;
+    }
+
+    struct libusb_device *found = nullptr;
+    for (ssize_t i = 0; i < num_devices; i++) {
+        struct libusb_device_descriptor desc;
+        struct libusb_device *device = list[i];
+
+        ret = libusb_get_device_descriptor(device, &desc);
+        if (ret != LIBUSB_SUCCESS) {
+            (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+            continue;
+        }
+
+        if (desc.idVendor == VID && desc.idProduct == PID) {
+            found = device;
+            break;
+        }
+    }
+
+    libusb_device_handle *device_handle = nullptr;
+    if (found) {
+        ret = libusb_open(found, &device_handle);
+        if (ret != LIBUSB_SUCCESS) {
+            (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+        }
+    }
+    else {
+        (void)fprintf(stderr, "Error: Could not find device!\n");
+    }
+    libusb_free_device_list(list, 1);
+
+    return device_handle;
+}
+
 static libusb_device_handle *usb_init()
 {
     int ret = libusb_init_context(nullptr, nullptr, 0);
-    if (ret < 0) {
-        (void)fprintf(stderr, "Failed to initialise libusb: %s\n", libusb_error_name(ret));
-        return nullptr;
-    }
-    libusb_device_handle *dev = libusb_open_device_with_vid_pid(nullptr, VID, PID);
-    if (!dev) {
-        (void)fprintf(stderr, "Warning: Device not found.\n");
+    if (ret != LIBUSB_SUCCESS) {
+        (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
         return nullptr;
     }
 
-    libusb_set_auto_detach_kernel_driver(dev, 1);
-
-    if (libusb_claim_interface(dev, 0) < 0) {
-        (void)fprintf(stderr, "Warning: Could not claim interface.\n");
-        libusb_close(dev);
+    libusb_device_handle *device_handle = usb_open_device();
+    if (!device_handle) {
         libusb_exit(nullptr);
         return nullptr;
     }
 
-    return dev;
+    libusb_set_auto_detach_kernel_driver(device_handle, 1);
+
+    ret = libusb_claim_interface(device_handle, DISPLAY_INTERFACE);
+    if (ret != LIBUSB_SUCCESS) {
+        (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+        libusb_close(device_handle);
+        libusb_exit(nullptr);
+        return nullptr;
+    }
+
+    return device_handle;
 }
 
 static void usb_release(libusb_device_handle *dev)
