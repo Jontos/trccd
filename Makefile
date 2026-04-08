@@ -8,9 +8,9 @@ bindir ?= $(exec_prefix)/bin
 libdir ?= $(exec_prefix)/lib
 sysconfdir ?= $(prefix)/etc
 
-EXTRA_CFLAGS = -std=gnu23 -Wall -Wextra
+EXTRA_CFLAGS = -Wall -Wextra -std=gnu23 $(shell pkg-config --cflags $(packages))
 CFLAGS = -O2 $(EXTRA_CFLAGS)
-LDLIBS = $(shell pkgconf --libs $(packages)) -lm 
+LDLIBS = $(shell pkg-config --libs $(packages))
 
 .PHONY: all clean debug install
 
