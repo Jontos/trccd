@@ -11,16 +11,16 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VID 0x0416
-#define PID 0x5302
-#define EP_OUT 0x02 
+constexpr uint16_t VID = 0x0416;
+constexpr uint16_t PID = 0x5302;
+constexpr unsigned char EP_OUT = 0x02;
 
-#define LCD_WIDTH 320
-#define LCD_HEIGHT 240
-#define NUM_PIXELS (LCD_HEIGHT * LCD_WIDTH)
+constexpr int LCD_WIDTH = 320;
+constexpr int LCD_HEIGHT = 240;
+constexpr int NUM_PIXELS = LCD_HEIGHT * LCD_WIDTH;
 
-#define FRAME_SIZE (size_t)(NUM_PIXELS * 2)
-#define PACKET_SIZE 512
+constexpr size_t FRAME_SIZE = NUM_PIXELS * 2;
+constexpr int PACKET_SIZE = 512;
 
 enum mode {
     NOTHING,
