@@ -20,7 +20,7 @@ constexpr int DISPLAY_INTERFACE = 0;
 constexpr int LCD_WIDTH = 320;
 constexpr int LCD_HEIGHT = 240;
 constexpr int NUM_PIXELS = LCD_HEIGHT * LCD_WIDTH;
-constexpr uint8_t MAX_FRAME_RATE = 22;
+constexpr float MAX_FRAME_RATE = 22;
 
 constexpr size_t FRAME_SIZE = NUM_PIXELS * 2;
 constexpr int PACKET_SIZE = 512;
@@ -259,8 +259,25 @@ static void close_process_pipe(struct process_pipe *proc_pipe)
     }
 }
 
-float probe_frame_rate(const char *filepath)
+static long str_to_l(const char *nptr, char **endptr)
 {
+    errno = 0;
+    long num = strtol(nptr, endptr, 10);
+    if (nptr == *endptr) {
+        return -1;
+    }
+    if (errno == ERANGE) {
+        perror("strtol");
+        return -1;
+    }
+
+    return num;
+}
+
+static float probe_frame_rate(const char *filepath)
+{
+    if (!filepath) return MAX_FRAME_RATE;
+
     const char *args[] = {
         "ffprobe", 
         "-loglevel", "error",
@@ -271,55 +288,49 @@ float probe_frame_rate(const char *filepath)
     };
 
     struct process_pipe proc_pipe = fork_child_proc(args);
-    char buffer[64];
-    size_t nread = fread(buffer, sizeof(*buffer), sizeof(buffer), proc_pipe.stream);
+    if (!proc_pipe.stream) return MAX_FRAME_RATE;
+    char buffer[64] = {0};
+    size_t nread = fread(buffer, sizeof(*buffer), sizeof(buffer) - 1, proc_pipe.stream);
     close_process_pipe(&proc_pipe);
 
-    if (nread <= 0) return MAX_FRAME_RATE;
-    errno = 0;
+    if (nread == 0) return MAX_FRAME_RATE;
+
     char *endptr;
-    long num = strtol(buffer, &endptr, 10);
-    if (buffer == endptr) {
+    long num = str_to_l(buffer, &endptr);
+    if (num < 0) {
         (void)fprintf(stderr, "ffprobe returned invalid FPS value\n");
         return MAX_FRAME_RATE;
     }
-    if (errno == ERANGE) {
-        perror("strtol");
-        return MAX_FRAME_RATE;
+
+    if (*endptr != '/') {
+        return (float)num < MAX_FRAME_RATE ? (float)num : MAX_FRAME_RATE;
     }
+
     char *nptr = endptr + 1;
-    long denom = strtol(nptr, &endptr, 10);
-    if (nptr == endptr) {
+    long denom = str_to_l(nptr, &endptr);
+    if (denom <= 0) {
         (void)fprintf(stderr, "ffprobe returned invalid FPS value\n");
         return MAX_FRAME_RATE;
     }
-    if (errno == ERANGE) {
-        perror("strtol");
-        return MAX_FRAME_RATE;
-    }
+
     float frame_rate = (float)num / (float)denom;
 
     return frame_rate < MAX_FRAME_RATE ? frame_rate : MAX_FRAME_RATE;
 }
 
-static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
+static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode, float *frame_rate)
 {
     struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
     char vf_str[256];
-    char fps_str[] = ",fps=22";
+    char fps_str[32] = {0};
 
     if (mode == VIDEO) {
-        float frame_rate = probe_frame_rate(filepath);
-        if (frame_rate != MAX_FRAME_RATE) {
-            if (snprintf(fps_str, sizeof(fps_str), ",fps=%.4g", frame_rate) < 0) {
-                perror("snprintf");
-                return proc_pipe;
-            }
+        *frame_rate = probe_frame_rate(filepath);
+        if (snprintf(fps_str, sizeof(fps_str), ",fps=%g", *frame_rate) < 0) {
+            perror("snprintf");
+            return proc_pipe;
         }
-    }
-    else {
-        fps_str[0] = '\0';
     }
 
     if (snprintf(vf_str, sizeof(vf_str),
@@ -364,12 +375,12 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
     return fork_child_proc(args);
 }
 
-static struct process_pipe open_pipe(const char *path_arg, enum mode mode)
+static struct process_pipe open_pipe(const char *path_arg, enum mode mode, float *frame_rate)
 {
     struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
     if (path_arg) {
-        proc_pipe = spawn_ffmpeg(path_arg, mode);
+        proc_pipe = spawn_ffmpeg(path_arg, mode, frame_rate);
         if (!proc_pipe.stream) {
             (void)fprintf(stderr, "Failed to spawn ffmpeg pipe\n");
         }
@@ -383,7 +394,7 @@ static struct process_pipe open_pipe(const char *path_arg, enum mode mode)
 
 static int display_image(const char *image, libusb_device_handle *dev)
 {
-    struct process_pipe proc_pipe = open_pipe(image, IMAGE);
+    struct process_pipe proc_pipe = open_pipe(image, IMAGE, nullptr);
     if (!proc_pipe.stream) return 1;
 
     unsigned char frame_buffer[FRAME_SIZE];
@@ -409,7 +420,8 @@ static int display_image(const char *image, libusb_device_handle *dev)
 
 static int display_video(const char *filepath, libusb_device_handle *dev)
 {
-    struct process_pipe proc_pipe = open_pipe(filepath, VIDEO);
+    float frame_rate = MAX_FRAME_RATE;
+    struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
     if (!proc_pipe.stream) return 1;
 
     size_t frame_capacity = 300;
@@ -443,12 +455,39 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
         return 1;
     }
 
+    constexpr long second_ns = 1'000'000'000L;
+    const long frame_time_ns = (long)((double)second_ns / (double)frame_rate);
+    struct timespec start, end;
+
+    long frame_lag_ns = 0;
     size_t current_frame = 0;
     while (keep_running) {
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
         unsigned char *frame_ptr = &video_buffer[current_frame * (size_t)FRAME_SIZE];
         usb_send_header(dev);
         usb_send_data(frame_ptr, FRAME_SIZE, dev);
         current_frame = (current_frame + 1) % num_frames;
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+
+        long elapsed_ns = (end.tv_sec - start.tv_sec) * second_ns + (end.tv_nsec - start.tv_nsec);
+        long remaining_ns = frame_time_ns - elapsed_ns - frame_lag_ns;
+        if (remaining_ns > 0) {
+            struct timespec sleep = {
+                .tv_sec = remaining_ns / second_ns,
+                .tv_nsec = remaining_ns % second_ns
+            };
+            nanosleep(&sleep, nullptr);
+            frame_lag_ns = 0;
+        }
+        else {
+            frame_lag_ns = -remaining_ns;
+            while (frame_lag_ns > frame_time_ns) {
+                current_frame = (current_frame + 1) % num_frames;
+                frame_lag_ns -= frame_time_ns;
+            }
+        }
     }
     free(video_buffer);
 
