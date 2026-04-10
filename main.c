@@ -227,7 +227,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
     args[idx++] = "ffmpeg";
     args[idx++] = "-nostdin";
     args[idx++] = "-loglevel";
-    args[idx++] = "quiet";
+    args[idx++] = "fatal";
     args[idx++] = "-i";
     args[idx++] = filepath;
 
@@ -305,14 +305,7 @@ static void close_process_pipe(struct process_pipe *proc_pipe)
     }
 
     if (proc_pipe->child_pid > 0) {
-        int status;
-        waitpid(proc_pipe->child_pid, &status, 0);
-        if (WIFEXITED(status)) {
-            int exit_code = WEXITSTATUS(status);
-            if (exit_code) {
-                (void)fprintf(stderr, "Ffmpeg failed with error code: %d\n", exit_code);
-            }
-        }
+        waitpid(proc_pipe->child_pid, nullptr, 0);
         proc_pipe->child_pid = -1;
     }
 }
