@@ -20,6 +20,7 @@ constexpr int DISPLAY_INTERFACE = 0;
 constexpr int LCD_WIDTH = 320;
 constexpr int LCD_HEIGHT = 240;
 constexpr int NUM_PIXELS = LCD_HEIGHT * LCD_WIDTH;
+constexpr uint8_t MAX_FRAME_RATE = 22;
 
 constexpr size_t FRAME_SIZE = NUM_PIXELS * 2;
 constexpr int PACKET_SIZE = 512;
@@ -204,7 +205,7 @@ struct process_pipe {
     pid_t child_pid;
 };
 
-static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
+static struct process_pipe fork_child_proc(const char *args[])
 {
     struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
@@ -214,13 +215,124 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
         return proc_pipe;
     }
 
+    pid_t pid = fork();
+    switch (pid) {
+        case -1:
+            (void)fprintf(stderr, "Failed to fork %s: %s\n", args[0], strerror(errno));
+            close(fildes[0]);
+            close(fildes[1]);
+            break;
+        case 0:
+            close(fildes[0]);
+            dup2(fildes[1], STDOUT_FILENO);
+            close(fildes[1]);
+            execvp(args[0], (char *const *)args);
+            (void)fprintf(stderr, "Failed to exec %s: %s\n", args[0], strerror(errno));
+            _exit(1);
+        default:
+            close(fildes[1]);
+            proc_pipe.stream = fdopen(fildes[0], "r");
+            if (!proc_pipe.stream) {
+                perror("Failed to open pipe for reading");
+                close(fildes[0]);
+                waitpid(pid, nullptr, 0);
+                break;
+            }
+            proc_pipe.child_pid = pid;
+    }
+
+    return proc_pipe;
+}
+
+static void close_process_pipe(struct process_pipe *proc_pipe)
+{
+    if (proc_pipe->stream && proc_pipe->stream != stdin) {
+        if (fclose(proc_pipe->stream) == EOF) {
+            perror("Failed to close pipe");
+        }
+        proc_pipe->stream = nullptr;
+    }
+
+    if (proc_pipe->child_pid > 0) {
+        waitpid(proc_pipe->child_pid, nullptr, 0);
+        proc_pipe->child_pid = -1;
+    }
+}
+
+float probe_frame_rate(const char *filepath)
+{
+    const char *args[] = {
+        "ffprobe", 
+        "-loglevel", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=avg_frame_rate",
+        "-output_format", "csv=print_section=0",
+        filepath, nullptr
+    };
+
+    struct process_pipe proc_pipe = fork_child_proc(args);
+    char buffer[64];
+    size_t nread = fread(buffer, sizeof(*buffer), sizeof(buffer), proc_pipe.stream);
+    close_process_pipe(&proc_pipe);
+
+    if (nread <= 0) return MAX_FRAME_RATE;
+    errno = 0;
+    char *endptr;
+    long num = strtol(buffer, &endptr, 10);
+    if (buffer == endptr) {
+        (void)fprintf(stderr, "ffprobe returned invalid FPS value\n");
+        return MAX_FRAME_RATE;
+    }
+    if (errno == ERANGE) {
+        perror("strtol");
+        return MAX_FRAME_RATE;
+    }
+    char *nptr = endptr + 1;
+    long denom = strtol(nptr, &endptr, 10);
+    if (nptr == endptr) {
+        (void)fprintf(stderr, "ffprobe returned invalid FPS value\n");
+        return MAX_FRAME_RATE;
+    }
+    if (errno == ERANGE) {
+        perror("strtol");
+        return MAX_FRAME_RATE;
+    }
+    float frame_rate = (float)num / (float)denom;
+
+    return frame_rate < MAX_FRAME_RATE ? frame_rate : MAX_FRAME_RATE;
+}
+
+static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
+{
+    struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
+
     char vf_str[256];
-    (void)snprintf(vf_str, sizeof(vf_str),
-                   "scale=%d:%d:force_original_aspect_ratio=increase,"
-                   "crop=%d:%d,transpose=1%s",
-                   LCD_WIDTH, LCD_HEIGHT,
-                   LCD_WIDTH, LCD_HEIGHT,
-                   mode == VIDEO ? ",fps=22" : "");
+    char fps_str[] = ",fps=22";
+
+    if (mode == VIDEO) {
+        float frame_rate = probe_frame_rate(filepath);
+        if (frame_rate != MAX_FRAME_RATE) {
+            if (snprintf(fps_str, sizeof(fps_str), ",fps=%.4g", frame_rate) < 0) {
+                perror("snprintf");
+                return proc_pipe;
+            }
+        }
+    }
+    else {
+        fps_str[0] = '\0';
+    }
+
+    if (snprintf(vf_str, sizeof(vf_str),
+                 "scale=%d:%d:force_original_aspect_ratio=increase,"
+                 "crop=%d:%d,transpose=1%s",
+                 LCD_WIDTH, LCD_HEIGHT,
+                 LCD_WIDTH, LCD_HEIGHT,
+                 fps_str) < 0)
+    {
+        perror("snprintf");
+        return proc_pipe;
+    }
+
     const char *args[32];
     int idx = 0;
 
@@ -249,33 +361,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode)
     args[idx++] = "-";
     args[idx++] = nullptr;
 
-    pid_t pid = fork();
-    switch (pid) {
-        case -1:
-            perror("Failed to fork ffmpeg");
-            close(fildes[0]);
-            close(fildes[1]);
-            break;
-        case 0:
-            close(fildes[0]);
-            dup2(fildes[1], STDOUT_FILENO);
-            close(fildes[1]);
-            execvp(args[0], (char *const *)args);
-            perror("Failed to exec ffmpeg");
-            _exit(1);
-        default:
-            close(fildes[1]);
-            proc_pipe.stream = fdopen(fildes[0], "r");
-            if (!proc_pipe.stream) {
-                perror("Failed to open pipe for reading");
-                close(fildes[0]);
-                waitpid(pid, nullptr, 0);
-                break;
-            }
-            proc_pipe.child_pid = pid;
-    }
-
-    return proc_pipe;
+    return fork_child_proc(args);
 }
 
 static struct process_pipe open_pipe(const char *path_arg, enum mode mode)
@@ -293,21 +379,6 @@ static struct process_pipe open_pipe(const char *path_arg, enum mode mode)
     }
 
     return proc_pipe;
-}
-
-static void close_process_pipe(struct process_pipe *proc_pipe)
-{
-    if (proc_pipe->stream && proc_pipe->stream != stdin) {
-        if (fclose(proc_pipe->stream) == EOF) {
-            perror("Failed to close pipe");
-        }
-        proc_pipe->stream = nullptr;
-    }
-
-    if (proc_pipe->child_pid > 0) {
-        waitpid(proc_pipe->child_pid, nullptr, 0);
-        proc_pipe->child_pid = -1;
-    }
 }
 
 static int display_image(const char *image, libusb_device_handle *dev)
@@ -350,7 +421,7 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
     }
 
     size_t num_frames = 0;
-    while (keep_running && fread(&video_buffer[num_frames * FRAME_SIZE], 1, FRAME_SIZE, proc_pipe.stream) == FRAME_SIZE) {
+    while (keep_running && fread(&video_buffer[num_frames * FRAME_SIZE], sizeof(*video_buffer), FRAME_SIZE, proc_pipe.stream) == FRAME_SIZE) {
         num_frames++;
         if (num_frames >= frame_capacity) {
             frame_capacity *= 2;
