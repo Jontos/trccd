@@ -2,6 +2,7 @@
 #include <libusb-1.0/libusb.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stdcountof.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -112,13 +113,15 @@ static libusb_device_handle *usb_init()
     return device_handle;
 }
 
-static void usb_release(libusb_device_handle *dev)
+static void usb_release(libusb_device_handle **dev)
 {
-    int ret = libusb_release_interface(dev, 0);
+    if (!*dev) return;
+
+    int ret = libusb_release_interface(*dev, 0);
     if (ret < 0) {
-        (void)fprintf(stderr, "[-] Failed: %s\n", libusb_error_name(ret));
+        (void)fprintf(stderr, "libusb error: %s\n", libusb_error_name(ret));
     }
-    libusb_close(dev);
+    libusb_close(*dev);
     libusb_exit(nullptr);
 }
 
@@ -127,7 +130,7 @@ static int usb_send_data(unsigned char *data, int length, libusb_device_handle *
     int ret = libusb_interrupt_transfer(dev, EP_OUT, data, length, nullptr, 5000);
 
     if (ret < 0) {
-        (void)fprintf(stderr, "[-] Failed: %s\n", libusb_error_name(ret));
+        (void)fprintf(stderr, "libusb error: %s\n", libusb_error_name(ret));
     }
 
     return ret;
@@ -180,11 +183,11 @@ static int print_colour(const char *colour_str, libusb_device_handle *dev)
     unsigned long colour = strtoul(colour_str, &endptr, 16);
     if (endptr == colour_str || *endptr != '\0') {
         (void)fprintf(stderr, "Failed to parse colour\n");
-        return 1;
+        return -1;
     }
     if (errno == ERANGE || colour > UINT16_MAX) {
         (void)fprintf(stderr, "Colour value out of range!\n");
-        return 1;
+        return -1;
     }
 
     unsigned char buffer[FRAME_SIZE];
@@ -195,7 +198,7 @@ static int print_colour(const char *colour_str, libusb_device_handle *dev)
     }
 
     if (usb_send_header(dev) < 0 ||
-        usb_send_data(buffer, FRAME_SIZE, dev) < 0) return 1;
+        usb_send_data(buffer, FRAME_SIZE, dev) < 0) return -1;
 
     return keep_alive(dev);
 }
@@ -395,7 +398,7 @@ static struct process_pipe open_pipe(const char *path_arg, enum mode mode, float
 static int display_image(const char *image, libusb_device_handle *dev)
 {
     struct process_pipe proc_pipe = open_pipe(image, IMAGE, nullptr);
-    if (!proc_pipe.stream) return 1;
+    if (!proc_pipe.stream) return -1;
 
     unsigned char frame_buffer[FRAME_SIZE];
     if (fread(frame_buffer, 1, FRAME_SIZE, proc_pipe.stream) < FRAME_SIZE) {
@@ -406,7 +409,7 @@ static int display_image(const char *image, libusb_device_handle *dev)
             perror("Failed to read image");
         }
         close_process_pipe(&proc_pipe);
-        return 1;
+        return -1;
     }
     close_process_pipe(&proc_pipe);
 
@@ -422,14 +425,14 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
 {
     float frame_rate = MAX_FRAME_RATE;
     struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
-    if (!proc_pipe.stream) return 1;
+    if (!proc_pipe.stream) return -1;
 
     size_t frame_capacity = 300;
     unsigned char *video_buffer = malloc(frame_capacity * (size_t)FRAME_SIZE);
     if (!video_buffer) {
         perror("malloc");
         close_process_pipe(&proc_pipe);
-        return 1;
+        return -1;
     }
 
     size_t num_frames = 0;
@@ -442,7 +445,7 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
                 perror("realloc");
                 free(video_buffer);
                 close_process_pipe(&proc_pipe);
-                return 1;
+                return -1;
             }
             video_buffer = new_buf;
         }
@@ -452,7 +455,7 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
     if (num_frames == 0) {
         (void)fprintf(stderr, "Error: No frames were read from the video stream.\n");
         free(video_buffer);
-        return 1;
+        return -1;
     }
 
     constexpr long second_ns = 1'000'000'000L;
@@ -529,8 +532,7 @@ int main(int argc, const char **argv)
     struct commands {
         const char *command;
         enum mode mode;
-    }
-    commands[] = {
+    } commands[] = {
         {"image", IMAGE},
         {"colour", COLOUR},
         {"color", COLOUR},
@@ -539,8 +541,7 @@ int main(int argc, const char **argv)
     };
 
     if (argc > 1) {
-        int num_commands = sizeof(commands) / sizeof(commands[0]);
-        for (int i = 0; i < num_commands; i++) {
+        for (uint32_t i = 0; i < countof(commands); i++) {
             if (strcmp(argv[1], commands[i].command) == 0) {
                 do_what = commands[i].mode;
                 break;
@@ -548,29 +549,27 @@ int main(int argc, const char **argv)
         }
     }
 
+    [[gnu::cleanup(usb_release)]]
     libusb_device_handle *device = nullptr;
-    if (do_what > 1) {
+    if (do_what != NOTHING && do_what != PRINT_USAGE) {
         device = usb_init();
         if (!device) return 1;
     }
 
-    int ret = 0;
     switch (do_what) {
         case IMAGE:
-            ret = display_image(argc >= 3 ? argv[2] : nullptr, device);
-            break;
+            if (display_image(argc >= 3 ? argv[2] : nullptr, device) < 0) return 1;
+            return 0;
         case COLOUR:
-            if (argc == 3) {
-                ret = print_colour(argv[2], device);
-            }
-            else {
+            if (argc < 3) {
                 print_usage(stderr, argv[0]);
-                ret = 1;
+                return 1;
             }
-            break;
+            if (print_colour(argv[2], device) < 0) return 1;
+            return 0;
         case VIDEO:
-            ret = display_video(argc >= 3 ? argv[2] : nullptr, device);
-            break;
+            if (display_video(argc >= 3 ? argv[2] : nullptr, device) < 0) return 1;
+            return 0;
         case NOTHING:
             print_usage(stderr, argv[0]);
             return 1;
@@ -578,8 +577,4 @@ int main(int argc, const char **argv)
             print_usage(stdout, argv[0]);
             return 0;
     }
-
-    usb_release(device);
-
-    return ret;
 }
