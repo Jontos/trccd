@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdcountof.h>
 #include <stddef.h>
@@ -108,6 +109,8 @@ static libusb_device_handle *usb_init()
 
 static void usb_release(libusb_device_handle **dev)
 {
+    if (!*dev) return;
+
     const int ret = libusb_release_interface(*dev, DISPLAY_INTERFACE);
 
     if (ret < 0) {
@@ -245,7 +248,7 @@ static struct process_pipe fork_child_proc(const char *args[])
     return proc_pipe;
 }
 
-static void close_process_pipe(struct process_pipe *proc_pipe)
+static void close_process_pipe(struct process_pipe *const proc_pipe)
 {
     if (proc_pipe->stream && proc_pipe->stream != stdin) {
         if (fclose(proc_pipe->stream) == EOF) {
@@ -424,14 +427,48 @@ static int display_image(const char *image, libusb_device_handle *dev)
     return keep_alive(dev);
 }
 
-static void *map_temp_file(const char *filepath, const size_t size, int *const fd)
+static char *generate_cache_file_template()
 {
-    void *mapped_mem = nullptr;
     char *template = nullptr;
-    if (asprintf(&template, "%.16s.XXXXXX", basename(filepath)) < 0) {
-        perror("asprintf");
-        return nullptr;
+    const char *cache_dir = getenv("CACHE_DIRECTORY");
+    if (cache_dir) {
+        if (cache_dir[0] == '\0') {
+            (void)fprintf (stderr, "No cache directory set, does service "
+                           "file contain `CacheDirectory=`?\n");
+            return nullptr;
+        }
+        if (asprintf(&template, "%s/XXXXXX", cache_dir) < 0) goto err;
+    } else {
+        cache_dir = getenv("XDG_CACHE_HOME");
+        if (!cache_dir || cache_dir[0] == '\0') {
+            const char *home_dir = getenv("HOME");
+            if (!home_dir || home_dir[0] == '\0') {
+                (void)fprintf (stderr,
+                               "Can't locate cache directory, "
+                               "XDG_CACHE_HOME is empty or unset\n");
+                return nullptr;
+            }
+            if (asprintf(&template, "%s/.cache/XXXXXX", home_dir) < 0) goto err;
+        } else {
+            if (asprintf(&template, "%s/XXXXXX", cache_dir) < 0) goto err;
+        }
     }
+
+    return template;
+err:
+    perror("Failed to allocate string for cache file!");
+
+    return nullptr;
+}
+
+// Cap video length to 24 hours
+constexpr unsigned int ONE_DAY_S = 24 * 60 * 60;
+constexpr size_t VIRT_MEM = FRAME_SIZE * (size_t)MAX_FRAME_RATE * ONE_DAY_S;
+
+static void *map_temp_file(int *const fd)
+{
+    char *template = generate_cache_file_template();
+    if (!template) return nullptr;
 
     *fd = mkstemp(template);
     if (*fd < 0) {
@@ -442,11 +479,10 @@ static void *map_temp_file(const char *filepath, const size_t size, int *const f
     unlink(template);
     free(template);
 
-    mapped_mem = mmap(nullptr, size,
-                      PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    void *mapped_mem = mmap(nullptr, VIRT_MEM,
+                            PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (mapped_mem == MAP_FAILED) {
-        mapped_mem = nullptr;
-        perror("mmap");
+        perror("Failed to create memory mapping!");
         close(*fd);
         return nullptr;
     }
@@ -454,93 +490,173 @@ static void *map_temp_file(const char *filepath, const size_t size, int *const f
     return mapped_mem;
 }
 
-static int map_overlay_mem(const int mem_fd, struct process_pipe *proc_pipe, void *mem_buf,
-                           const size_t virt_mem_size, size_t *total_mem)
+struct thread_context {
+    uint8_t *mem_buf;
+    unsigned int frames_written;
+    bool finished_reading;
+
+    pthread_mutex_t mutex;
+    pthread_cond_t frames_ready;
+};
+
+struct reader_data {
+    const int mem_fd;
+    struct process_pipe *const proc_pipe;
+
+    struct thread_context *const thread_ctx;
+};
+
+static int grow_mapping(size_t *const capacity, const int fd,
+                        const size_t chunk_size, void *const mem_buf)
 {
-    const int pipe_fd = fileno(proc_pipe->stream);
-    constexpr size_t CHUNK_SIZE = 256000000;
-    size_t file_capacity = 0;
-    while (keep_running) {
-        if (*total_mem >= file_capacity) {
-            file_capacity += CHUNK_SIZE;
-
-            if (ftruncate(mem_fd, (off_t)file_capacity) < 0) {
-                perror("ftruncate");
-                return -1;
-            }
-
-            if (mmap(mem_buf + *total_mem, CHUNK_SIZE,
-                     PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, 
-                     mem_fd, (off_t)*total_mem) == MAP_FAILED)
-            {
-                perror("mmap overlay");
-                return -1;
-            }
-        }
-
-        const size_t space_left = file_capacity - *total_mem;
-        const ssize_t nread = splice(pipe_fd, nullptr, mem_fd, nullptr, space_left, SPLICE_F_MOVE);
-        if (nread < 0) {
-            perror("splice");
-            return -1;
-        }
-        if (nread == 0) break;
-
-        *total_mem += (size_t)nread;
+    if (*capacity + chunk_size > VIRT_MEM) {
+        (void)fprintf(stderr, "Memory limit exceeded, truncating video\n");
+        return 1;
     }
-    close_process_pipe(proc_pipe);
 
-    ftruncate(mem_fd, (off_t)*total_mem);
-    if (*total_mem < virt_mem_size) {
-        munmap(mem_buf + *total_mem, virt_mem_size - *total_mem);
+    if (ftruncate(fd, (off_t)(*capacity + chunk_size)) < 0) {
+        perror("Failed to increase size of temp file!");
+        return -1;
     }
-    madvise(mem_buf, *total_mem, MADV_SEQUENTIAL);
+
+    if (mmap(mem_buf + *capacity, chunk_size,
+             PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, 
+             fd, (off_t)*capacity) == MAP_FAILED)
+    {
+        perror("Failed to grow mapped memory!");
+        return -1;
+    }
+
+    *capacity += chunk_size;
 
     return 0;
 }
 
-static int display_video(const char *filepath, libusb_device_handle *dev)
+static void *read_frames(void *userdata)
 {
-    double frame_rate = MAX_FRAME_RATE;
-    struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
-    if (!proc_pipe.stream) return -1;
+    const struct reader_data *const data = userdata;
+    struct thread_context *const ctx = data->thread_ctx;
 
-    constexpr size_t VIRTUAL_RES_MEM = 16000000000;
-    int mem_fd = -1;
-    uint8_t *video_buffer = map_temp_file(filepath, VIRTUAL_RES_MEM, &mem_fd);
-    if (!video_buffer) return -1;
+    const int pipe_fd = fileno(data->proc_pipe->stream);
 
+    constexpr size_t CHUNK_SIZE = 256 * 1024 * 1024;
+    size_t file_capacity = 0;
     size_t total_mem = 0;
-    if (map_overlay_mem(mem_fd, &proc_pipe, video_buffer, VIRTUAL_RES_MEM, &total_mem) < 0) {
-        return -1;
+
+    void *ret = (void*)(intptr_t)-1; // NOLINT(performance-no-int-to-ptr)
+    unsigned int num_frames = 0;
+    while (keep_running) {
+        if (total_mem == file_capacity) {
+            const int mem_ret = grow_mapping(&file_capacity, data->mem_fd, CHUNK_SIZE, ctx->mem_buf);
+            if (mem_ret < 0) {
+                goto exit;
+            } else if (mem_ret == 1) {
+                break;
+            }
+        }
+
+        const size_t space_left = file_capacity - total_mem;
+        const ssize_t nread = splice(pipe_fd, nullptr, data->mem_fd, nullptr, space_left, SPLICE_F_MOVE);
+        if (nread < 0) {
+            perror("Failed to read data from ffmpeg!");
+            goto exit;
+        }
+
+        total_mem += (size_t)nread;
+        num_frames = (unsigned int)(total_mem / FRAME_SIZE);
+
+        if (nread == 0) break;
+
+        if (num_frames > ctx->frames_written) {
+            pthread_mutex_lock(&ctx->mutex);
+            ctx->frames_written = num_frames;
+            pthread_cond_signal(&ctx->frames_ready);
+            pthread_mutex_unlock(&ctx->mutex);
+        }
     }
 
-    constexpr long second_ns = 1'000'000'000L;
-    struct timespec start, end;
+    if (num_frames) {
+        ret = nullptr;
+    } else {
+        goto exit;
+    }
 
-    const long frame_time_ns = (long)(second_ns / frame_rate);
-    const unsigned int num_frames = (unsigned int)(total_mem / FRAME_SIZE);
+    if (ftruncate(data->mem_fd, (off_t)total_mem) < 0) {
+        perror("Failed to truncate temp file!");
+    }
+    if (total_mem < VIRT_MEM) {
+        const size_t pagesize = (size_t)sysconf(_SC_PAGESIZE);
+        total_mem = (total_mem + pagesize - 1) & ~(pagesize - 1);
+        if (munmap(ctx->mem_buf + total_mem, VIRT_MEM - total_mem) < 0) {
+            perror("Failed to unmap excess overlay memory!");
+        }
+    }
+
+exit:
+    close_process_pipe(data->proc_pipe);
+
+    pthread_mutex_lock(&ctx->mutex);
+    ctx->finished_reading = true;
+    pthread_cond_signal(&ctx->frames_ready);
+    pthread_mutex_unlock(&ctx->mutex);
+
+    return ret;
+}
+
+struct displayer_data {
+    libusb_device_handle *dev;
+    const double frame_rate;
+
+    struct thread_context *const thread_ctx;
+};
+
+static void *display_frames(void *userdata)
+{
+    const struct displayer_data *const data = userdata;
+    struct thread_context *const ctx = data->thread_ctx;
+
+    constexpr long second_ns = 1'000'000'000L;
+    const long frame_time_ns = (long)(second_ns / data->frame_rate);
+    struct timespec start, end;
     constexpr unsigned int NUM_RETRIES = 10;
 
+    void *err = (void*)(intptr_t)-1; // NOLINT(performance-no-int-to-ptr)
     long frame_lag_ns = 0;
     unsigned int current_frame = 0;
+    unsigned int num_frames = 0;
     while (keep_running) {
+        pthread_mutex_lock(&ctx->mutex);
+
+        while (!ctx->finished_reading && current_frame == ctx->frames_written &&
+               keep_running) {
+            pthread_cond_wait(&ctx->frames_ready, &ctx->mutex);
+        }
+
+        if (ctx->finished_reading && !ctx->frames_written) {
+            (void)fprintf(stderr, "No frames to read!\n");
+            pthread_mutex_unlock(&ctx->mutex);
+            return (void*)(intptr_t)-1; // NOLINT(performance-no-int-to-ptr)
+        }
+        num_frames = ctx->frames_written;
+
+        pthread_mutex_unlock(&ctx->mutex);
+
         unsigned int retries = NUM_RETRIES;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        while (usb_send_header(dev) < 0) {
+        while (usb_send_header(data->dev) < 0 && keep_running) {
             if (--retries == 0) {
                 (void)fprintf(stderr, "USB connection timed out!\n");
-                return -1;
+                return err;
             }
         }
         retries = NUM_RETRIES;
 
-        uint8_t *frame_ptr = &video_buffer[current_frame * FRAME_SIZE];
-        while (usb_send_data(frame_ptr, FRAME_SIZE, dev) < 0) {
+        uint8_t *frame_ptr = &ctx->mem_buf[current_frame * FRAME_SIZE];
+        while (usb_send_data(frame_ptr, FRAME_SIZE, data->dev) < 0 && keep_running) {
             if (--retries == 0) {
                 (void)fprintf(stderr, "USB connection timed out!\n");
-                return -1;
+                return err;
             }
         }
         current_frame = (current_frame + 1) % num_frames;
@@ -561,6 +677,69 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
             frame_lag_ns %= frame_time_ns;
         }
     }
+
+    return nullptr;
+}
+
+static int display_video(const char *filepath, libusb_device_handle *dev)
+{
+    double frame_rate = MAX_FRAME_RATE;
+    struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
+    if (!proc_pipe.stream) return -1;
+
+    int mem_fd;
+    struct thread_context thread_ctx = {
+        .mem_buf = map_temp_file(&mem_fd)
+    };
+    if (!thread_ctx.mem_buf) return -1;
+
+    pthread_mutex_init(&thread_ctx.mutex, nullptr);
+    pthread_cond_init(&thread_ctx.frames_ready, nullptr);
+
+    bool prod_created = false;
+    bool cons_created = false;
+    pthread_t prod_tid, cons_tid;
+
+    int ret = pthread_create(&prod_tid, nullptr, read_frames, &(struct reader_data){
+        .mem_fd = mem_fd,
+        .proc_pipe = &proc_pipe,
+        .thread_ctx = &thread_ctx
+    });
+    if (ret != 0) goto cleanup;
+    prod_created = true;
+
+    ret = pthread_create(&cons_tid, nullptr, display_frames, &(struct displayer_data){
+        .dev = dev,
+        .frame_rate = frame_rate,
+        .thread_ctx = &thread_ctx
+    });
+    if (ret != 0) goto cleanup;
+    cons_created = true;
+
+cleanup:
+    if (ret != 0) {
+        (void)fprintf(stderr, "Failed to create thread: %s\n", strerror(ret));
+        keep_running = false;
+    }
+
+    int prod_ret = 0;
+    int cons_ret = 0;
+    void *res;
+    if (prod_created) {
+        pthread_join(prod_tid, &res);
+        prod_ret = (int)(intptr_t)res;
+        if (cons_created) {
+            pthread_join(cons_tid, &res);
+            cons_ret = (int)(intptr_t)res;
+        }
+    } else {
+        close_process_pipe(&proc_pipe);
+    }
+
+    pthread_cond_destroy(&thread_ctx.frames_ready);
+    pthread_mutex_destroy(&thread_ctx.mutex);
+
+    if (ret || prod_ret || cons_ret) return -1;
 
     return 0;
 }
