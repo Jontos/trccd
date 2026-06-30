@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdcountof.h>
 #include <stddef.h>
@@ -6,9 +7,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <sys/mman.h>
+#include <sys/wait.h>
 
 #include <libusb-1.0/libusb.h>
 
@@ -41,7 +44,7 @@ static libusb_device_handle *usb_open_device()
     const ssize_t num_devices = libusb_get_device_list(nullptr, &list);
     if (num_devices < 0) {
         ret = (int)num_devices;
-        (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+        (void)fprintf(stderr, "libusb failed to enumerate devices: %s\n", libusb_strerror(ret));
         return nullptr;
     }
 
@@ -52,7 +55,7 @@ static libusb_device_handle *usb_open_device()
 
         ret = libusb_get_device_descriptor(device, &desc);
         if (ret != LIBUSB_SUCCESS) {
-            (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+            (void)fprintf(stderr, "libusb failed to get device descriptor: %s\n", libusb_strerror(ret));
             continue;
         }
 
@@ -66,7 +69,7 @@ static libusb_device_handle *usb_open_device()
     if (found) {
         ret = libusb_open(found, &device_handle);
         if (ret != LIBUSB_SUCCESS) {
-            (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+            (void)fprintf(stderr, "libusb failed to open device: %s\n", libusb_strerror(ret));
         }
     } else {
         (void)fprintf(stderr, "Error: Could not find device!\n");
@@ -80,7 +83,7 @@ static libusb_device_handle *usb_init()
 {
     int ret = libusb_init_context(nullptr, nullptr, 0);
     if (ret != LIBUSB_SUCCESS) {
-        (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+        (void)fprintf(stderr, "libusb failed to initialise context: %s\n", libusb_strerror(ret));
         return nullptr;
     }
 
@@ -94,7 +97,7 @@ static libusb_device_handle *usb_init()
 
     ret = libusb_claim_interface(device_handle, DISPLAY_INTERFACE);
     if (ret != LIBUSB_SUCCESS) {
-        (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
+        (void)fprintf(stderr, "libusb failed to claim interface: %s\n", libusb_strerror(ret));
         libusb_close(device_handle);
         libusb_exit(nullptr);
         return nullptr;
@@ -108,7 +111,7 @@ static void usb_release(libusb_device_handle **dev)
     const int ret = libusb_release_interface(*dev, DISPLAY_INTERFACE);
 
     if (ret < 0) {
-        (void)fprintf(stderr, "libusb error: %s\n", libusb_error_name(ret));
+        (void)fprintf(stderr, "libusb failed to release device: %s\n", libusb_strerror(ret));
     }
 
     libusb_close(*dev);
@@ -120,7 +123,7 @@ static int usb_send_data(uint8_t *data, const int length, libusb_device_handle *
     const int ret = libusb_interrupt_transfer(dev, EP_OUT, data, length, nullptr, 5000);
 
     if (ret < 0) {
-        (void)fprintf(stderr, "libusb error: %s\n", libusb_error_name(ret));
+        (void)fprintf(stderr, "libusb failed to send data: %s\n", libusb_strerror(ret));
     }
 
     return ret;
@@ -421,60 +424,125 @@ static int display_image(const char *image, libusb_device_handle *dev)
     return keep_alive(dev);
 }
 
+static void *map_temp_file(const char *filepath, const size_t size, int *const fd)
+{
+    void *mapped_mem = nullptr;
+    char *template = nullptr;
+    if (asprintf(&template, "%.16s.XXXXXX", basename(filepath)) < 0) {
+        perror("asprintf");
+        return nullptr;
+    }
+
+    *fd = mkstemp(template);
+    if (*fd < 0) {
+        perror("mkstemp");
+        free(template);
+        return nullptr;
+    }
+    unlink(template);
+    free(template);
+
+    mapped_mem = mmap(nullptr, size,
+                      PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped_mem == MAP_FAILED) {
+        mapped_mem = nullptr;
+        perror("mmap");
+        close(*fd);
+        return nullptr;
+    }
+
+    return mapped_mem;
+}
+
+static int map_overlay_mem(const int mem_fd, struct process_pipe *proc_pipe, void *mem_buf,
+                           const size_t virt_mem_size, size_t *total_mem)
+{
+    const int pipe_fd = fileno(proc_pipe->stream);
+    constexpr size_t CHUNK_SIZE = 256000000;
+    size_t file_capacity = 0;
+    while (keep_running) {
+        if (*total_mem >= file_capacity) {
+            file_capacity += CHUNK_SIZE;
+
+            if (ftruncate(mem_fd, (off_t)file_capacity) < 0) {
+                perror("ftruncate");
+                return -1;
+            }
+
+            if (mmap(mem_buf + *total_mem, CHUNK_SIZE,
+                     PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, 
+                     mem_fd, (off_t)*total_mem) == MAP_FAILED)
+            {
+                perror("mmap overlay");
+                return -1;
+            }
+        }
+
+        const size_t space_left = file_capacity - *total_mem;
+        const ssize_t nread = splice(pipe_fd, nullptr, mem_fd, nullptr, space_left, SPLICE_F_MOVE);
+        if (nread < 0) {
+            perror("splice");
+            return -1;
+        }
+        if (nread == 0) break;
+
+        *total_mem += (size_t)nread;
+    }
+    close_process_pipe(proc_pipe);
+
+    ftruncate(mem_fd, (off_t)*total_mem);
+    if (*total_mem < virt_mem_size) {
+        munmap(mem_buf + *total_mem, virt_mem_size - *total_mem);
+    }
+    madvise(mem_buf, *total_mem, MADV_SEQUENTIAL);
+
+    return 0;
+}
+
 static int display_video(const char *filepath, libusb_device_handle *dev)
 {
     double frame_rate = MAX_FRAME_RATE;
     struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
     if (!proc_pipe.stream) return -1;
 
-    size_t frame_capacity = 300;
-    uint8_t *video_buffer = malloc(frame_capacity * FRAME_SIZE);
-    if (!video_buffer) {
-        perror("malloc");
-        close_process_pipe(&proc_pipe);
-        return -1;
-    }
+    constexpr size_t VIRTUAL_RES_MEM = 16000000000;
+    int mem_fd = -1;
+    uint8_t *video_buffer = map_temp_file(filepath, VIRTUAL_RES_MEM, &mem_fd);
+    if (!video_buffer) return -1;
 
-    unsigned int num_frames = 0;
-    while (keep_running) {
-        const size_t nread =
-            fread(&video_buffer[num_frames * FRAME_SIZE], sizeof(*video_buffer),
-                  FRAME_SIZE, proc_pipe.stream);
-        if (nread != FRAME_SIZE) break;
-
-        ++num_frames;
-        if (num_frames >= frame_capacity) {
-            frame_capacity *= 2;
-            uint8_t *new_buf = realloc(video_buffer, frame_capacity * FRAME_SIZE);
-            if (!new_buf) {
-                perror("realloc");
-                free(video_buffer);
-                close_process_pipe(&proc_pipe);
-                return -1;
-            }
-            video_buffer = new_buf;
-        }
-    }
-    close_process_pipe(&proc_pipe);
-
-    if (!num_frames) {
-        (void)fprintf(stderr, "Error: No frames were read from the video stream.\n");
-        free(video_buffer);
+    size_t total_mem = 0;
+    if (map_overlay_mem(mem_fd, &proc_pipe, video_buffer, VIRTUAL_RES_MEM, &total_mem) < 0) {
         return -1;
     }
 
     constexpr long second_ns = 1'000'000'000L;
-    const long frame_time_ns = (long)(second_ns / frame_rate);
     struct timespec start, end;
+
+    const long frame_time_ns = (long)(second_ns / frame_rate);
+    const unsigned int num_frames = (unsigned int)(total_mem / FRAME_SIZE);
+    constexpr unsigned int NUM_RETRIES = 10;
 
     long frame_lag_ns = 0;
     unsigned int current_frame = 0;
     while (keep_running) {
+        unsigned int retries = NUM_RETRIES;
         clock_gettime(CLOCK_MONOTONIC, &start);
 
+        while (usb_send_header(dev) < 0) {
+            if (--retries == 0) {
+                (void)fprintf(stderr, "USB connection timed out!\n");
+                return -1;
+            }
+        }
+        retries = NUM_RETRIES;
+
         uint8_t *frame_ptr = &video_buffer[current_frame * FRAME_SIZE];
-        usb_send_header(dev);
-        usb_send_data(frame_ptr, FRAME_SIZE, dev);
+        while (usb_send_data(frame_ptr, FRAME_SIZE, dev) < 0) {
+            if (--retries == 0) {
+                (void)fprintf(stderr, "USB connection timed out!\n");
+                return -1;
+            }
+        }
         current_frame = (current_frame + 1) % num_frames;
 
         clock_gettime(CLOCK_MONOTONIC, &end);
@@ -493,7 +561,6 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
             frame_lag_ns %= frame_time_ns;
         }
     }
-    free(video_buffer);
 
     return 0;
 }
