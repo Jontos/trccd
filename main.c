@@ -1,45 +1,36 @@
 #include <errno.h>
-#include <libusb-1.0/libusb.h>
 #include <signal.h>
-#include <stdbool.h>
 #include <stdcountof.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include <libusb-1.0/libusb.h>
+
 constexpr uint16_t VID = 0x0416;
 constexpr uint16_t PID = 0x5302;
-constexpr unsigned char EP_OUT = 0x02;
-constexpr int DISPLAY_INTERFACE = 0;
+constexpr uint8_t EP_OUT = 0x02;
+constexpr uint8_t DISPLAY_INTERFACE = 0;
 
-constexpr int LCD_WIDTH = 320;
-constexpr int LCD_HEIGHT = 240;
-constexpr int NUM_PIXELS = LCD_HEIGHT * LCD_WIDTH;
-constexpr float MAX_FRAME_RATE = 22;
+constexpr uint16_t LCD_WIDTH = 320;
+constexpr uint16_t LCD_HEIGHT = 240;
+constexpr uint32_t NUM_PIXELS = LCD_HEIGHT * LCD_WIDTH;
+constexpr double MAX_FRAME_RATE = 22;
 
-constexpr size_t FRAME_SIZE = NUM_PIXELS * 2;
-constexpr int PACKET_SIZE = 512;
+constexpr size_t FRAME_SIZE = NUM_PIXELS * sizeof(uint16_t);
+constexpr size_t PACKET_SIZE = 512;
 
-enum mode {
-    NOTHING,
-    PRINT_USAGE,
-    COLOUR,
-    IMAGE,
-    VIDEO
-};
-
-static volatile sig_atomic_t keep_running = 1;
+static volatile sig_atomic_t keep_running = true;
 
 static void sig_handler(int signum)
 {
     if (signum == SIGINT || signum == SIGTERM) {
-        keep_running = 0;
+        keep_running = false;
     }
 }
 
@@ -47,7 +38,7 @@ static libusb_device_handle *usb_open_device()
 {
     int ret;
     struct libusb_device **list;
-    ssize_t num_devices = libusb_get_device_list(nullptr, &list);
+    const ssize_t num_devices = libusb_get_device_list(nullptr, &list);
     if (num_devices < 0) {
         ret = (int)num_devices;
         (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
@@ -55,7 +46,7 @@ static libusb_device_handle *usb_open_device()
     }
 
     struct libusb_device *found = nullptr;
-    for (ssize_t i = 0; i < num_devices; i++) {
+    for (int i = 0; i < num_devices; ++i) {
         struct libusb_device_descriptor desc;
         struct libusb_device *device = list[i];
 
@@ -77,8 +68,7 @@ static libusb_device_handle *usb_open_device()
         if (ret != LIBUSB_SUCCESS) {
             (void)fprintf(stderr, "libusb error: %s\n", libusb_strerror(ret));
         }
-    }
-    else {
+    } else {
         (void)fprintf(stderr, "Error: Could not find device!\n");
     }
     libusb_free_device_list(list, 1);
@@ -115,19 +105,19 @@ static libusb_device_handle *usb_init()
 
 static void usb_release(libusb_device_handle **dev)
 {
-    if (!*dev) return;
+    const int ret = libusb_release_interface(*dev, DISPLAY_INTERFACE);
 
-    int ret = libusb_release_interface(*dev, 0);
     if (ret < 0) {
         (void)fprintf(stderr, "libusb error: %s\n", libusb_error_name(ret));
     }
+
     libusb_close(*dev);
     libusb_exit(nullptr);
 }
 
-static int usb_send_data(unsigned char *data, int length, libusb_device_handle *dev)
+static int usb_send_data(uint8_t *data, const int length, libusb_device_handle *dev)
 {
-    int ret = libusb_interrupt_transfer(dev, EP_OUT, data, length, nullptr, 5000);
+    const int ret = libusb_interrupt_transfer(dev, EP_OUT, data, length, nullptr, 5000);
 
     if (ret < 0) {
         (void)fprintf(stderr, "libusb error: %s\n", libusb_error_name(ret));
@@ -138,7 +128,7 @@ static int usb_send_data(unsigned char *data, int length, libusb_device_handle *
 
 static int usb_send_header(libusb_device_handle *dev)
 {
-    struct [[gnu::packed]] {
+    struct [[gnu::packed]] header {
         uint32_t magic;
         uint32_t command;
         uint16_t width;
@@ -146,31 +136,29 @@ static int usb_send_header(libusb_device_handle *dev)
         uint32_t unknown;
         uint32_t length;
         uint8_t padding[492];
-    } header = {
+    };
+
+    return usb_send_data((uint8_t*)&(struct header){
         .magic = 0xDDDCDBDA,
         .command = 0x00010002,
         .width = LCD_WIDTH,
         .height = LCD_HEIGHT,
         .unknown = 2,
         .length = 512,
-        .padding = {0}
-    };
-
-    return usb_send_data((unsigned char*)&header, PACKET_SIZE, dev);
+        .padding = {}
+    }, PACKET_SIZE, dev);
 }
 
 static int keep_alive(libusb_device_handle *dev)
 {
-    unsigned char nothing[PACKET_SIZE] = {0};
-
-    struct timespec sleep_duration = {
-        .tv_nsec = 500000000,
-        .tv_sec = 2
-    };
-
     while (keep_running) {
-        if (usb_send_data(nothing, PACKET_SIZE, dev) < 0) return 1;
-        nanosleep(&sleep_duration, nullptr);
+        if (usb_send_data((uint8_t[PACKET_SIZE]){}, PACKET_SIZE, dev) < 0) return -1;
+        // 2.5s is the longest interval between transfers that still keeps the
+        // connection alive
+        nanosleep(&(struct timespec){
+            .tv_nsec = 500000000,
+            .tv_sec = 2
+        }, nullptr);
     }
 
     return 0;
@@ -180,7 +168,7 @@ static int print_colour(const char *colour_str, libusb_device_handle *dev)
 {
     errno = 0;
     char *endptr;
-    unsigned long colour = strtoul(colour_str, &endptr, 16);
+    const unsigned long colour = strtoul(colour_str, &endptr, 16);
     if (endptr == colour_str || *endptr != '\0') {
         (void)fprintf(stderr, "Failed to parse colour\n");
         return -1;
@@ -190,7 +178,7 @@ static int print_colour(const char *colour_str, libusb_device_handle *dev)
         return -1;
     }
 
-    unsigned char buffer[FRAME_SIZE];
+    uint8_t buffer[FRAME_SIZE];
     uint16_t *buf_ptr = (uint16_t*)buffer;
     size_t count = FRAME_SIZE / sizeof(uint16_t);
     while (count--) {
@@ -218,26 +206,33 @@ static struct process_pipe fork_child_proc(const char *args[])
         return proc_pipe;
     }
 
-    pid_t pid = fork();
+    enum {
+        READ_END,
+        WRITE_END
+    };
+
+    const pid_t pid = fork();
     switch (pid) {
         case -1:
-            (void)fprintf(stderr, "Failed to fork %s: %s\n", args[0], strerror(errno));
-            close(fildes[0]);
-            close(fildes[1]);
+            (void)fprintf(stderr, "Failed to fork %s: %s\n", args[READ_END],
+                          strerror(errno));
+            close(fildes[READ_END]);
+            close(fildes[WRITE_END]);
             break;
         case 0:
-            close(fildes[0]);
-            dup2(fildes[1], STDOUT_FILENO);
-            close(fildes[1]);
-            execvp(args[0], (char *const *)args);
-            (void)fprintf(stderr, "Failed to exec %s: %s\n", args[0], strerror(errno));
-            _exit(1);
+            close(fildes[READ_END]);
+            dup2(fildes[WRITE_END], STDOUT_FILENO);
+            close(fildes[WRITE_END]);
+            execvp(args[READ_END], (char *const *)args);
+            (void)fprintf(stderr, "Failed to exec %s: %s\n", args[READ_END],
+                          strerror(errno));
+            _exit(EXIT_FAILURE);
         default:
-            close(fildes[1]);
-            proc_pipe.stream = fdopen(fildes[0], "r");
+            close(fildes[WRITE_END]);
+            proc_pipe.stream = fdopen(fildes[READ_END], "r");
             if (!proc_pipe.stream) {
                 perror("Failed to open pipe for reading");
-                close(fildes[0]);
+                close(fildes[READ_END]);
                 waitpid(pid, nullptr, 0);
                 break;
             }
@@ -265,7 +260,7 @@ static void close_process_pipe(struct process_pipe *proc_pipe)
 static long str_to_l(const char *nptr, char **endptr)
 {
     errno = 0;
-    long num = strtol(nptr, endptr, 10);
+    const long num = strtol(nptr, endptr, 10);
     if (nptr == *endptr) {
         return -1;
     }
@@ -277,7 +272,7 @@ static long str_to_l(const char *nptr, char **endptr)
     return num;
 }
 
-static float probe_frame_rate(const char *filepath)
+static double probe_frame_rate(const char *filepath)
 {
     if (!filepath) return MAX_FRAME_RATE;
 
@@ -292,41 +287,49 @@ static float probe_frame_rate(const char *filepath)
 
     struct process_pipe proc_pipe = fork_child_proc(args);
     if (!proc_pipe.stream) return MAX_FRAME_RATE;
-    char buffer[64] = {0};
-    size_t nread = fread(buffer, sizeof(*buffer), sizeof(buffer) - 1, proc_pipe.stream);
+    char buffer[64] = {};
+    const size_t nread = fread(buffer, sizeof(*buffer), sizeof(buffer) - 1, proc_pipe.stream);
     close_process_pipe(&proc_pipe);
 
     if (nread == 0) return MAX_FRAME_RATE;
 
     char *endptr;
-    long num = str_to_l(buffer, &endptr);
+    const long num = str_to_l(buffer, &endptr);
     if (num < 0) {
         (void)fprintf(stderr, "ffprobe returned invalid FPS value\n");
         return MAX_FRAME_RATE;
     }
 
     if (*endptr != '/') {
-        return (float)num < MAX_FRAME_RATE ? (float)num : MAX_FRAME_RATE;
+        return (double)num < MAX_FRAME_RATE ? (double)num : MAX_FRAME_RATE;
     }
 
     char *nptr = endptr + 1;
-    long denom = str_to_l(nptr, &endptr);
+    const long denom = str_to_l(nptr, &endptr);
     if (denom <= 0) {
         (void)fprintf(stderr, "ffprobe returned invalid FPS value\n");
         return MAX_FRAME_RATE;
     }
 
-    float frame_rate = (float)num / (float)denom;
+    const double frame_rate = (double)num / (double)denom;
 
     return frame_rate < MAX_FRAME_RATE ? frame_rate : MAX_FRAME_RATE;
 }
 
-static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode, float *frame_rate)
+enum mode {
+    NOTHING,
+    PRINT_USAGE,
+    COLOUR,
+    IMAGE,
+    VIDEO
+};
+
+static struct process_pipe spawn_ffmpeg(const char *filepath, const enum mode mode, double *frame_rate)
 {
-    struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
+    const struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
     char vf_str[256];
-    char fps_str[32] = {0};
+    char fps_str[32] = {};
 
     if (mode == VIDEO) {
         *frame_rate = probe_frame_rate(filepath);
@@ -360,8 +363,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode, fl
     if (mode == VIDEO) {
         args[idx++] = "-an";
         args[idx++] = "-sn";
-    }
-    else {
+    } else {
         args[idx++] = "-vframes";
         args[idx++] = "1";
     }
@@ -378,7 +380,7 @@ static struct process_pipe spawn_ffmpeg(const char *filepath, enum mode mode, fl
     return fork_child_proc(args);
 }
 
-static struct process_pipe open_pipe(const char *path_arg, enum mode mode, float *frame_rate)
+static struct process_pipe open_pipe(const char *path_arg, const enum mode mode, double *frame_rate)
 {
     struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
 
@@ -387,8 +389,7 @@ static struct process_pipe open_pipe(const char *path_arg, enum mode mode, float
         if (!proc_pipe.stream) {
             (void)fprintf(stderr, "Failed to spawn ffmpeg pipe\n");
         }
-    }
-    else {
+    } else {
         proc_pipe.stream = stdin;
     }
 
@@ -400,8 +401,9 @@ static int display_image(const char *image, libusb_device_handle *dev)
     struct process_pipe proc_pipe = open_pipe(image, IMAGE, nullptr);
     if (!proc_pipe.stream) return -1;
 
-    unsigned char frame_buffer[FRAME_SIZE];
-    if (fread(frame_buffer, 1, FRAME_SIZE, proc_pipe.stream) < FRAME_SIZE) {
+    uint8_t frame_buffer[FRAME_SIZE];
+    if (fread(frame_buffer, sizeof(*frame_buffer), sizeof(frame_buffer),
+              proc_pipe.stream) != sizeof(frame_buffer)) {
         if (feof(proc_pipe.stream)) {
             (void)fprintf(stderr, "Failed to read image\n");
         }
@@ -416,31 +418,34 @@ static int display_image(const char *image, libusb_device_handle *dev)
     usb_send_header(dev);
     usb_send_data(frame_buffer, FRAME_SIZE, dev);
 
-    keep_alive(dev);
-
-    return 0;
+    return keep_alive(dev);
 }
 
 static int display_video(const char *filepath, libusb_device_handle *dev)
 {
-    float frame_rate = MAX_FRAME_RATE;
+    double frame_rate = MAX_FRAME_RATE;
     struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
     if (!proc_pipe.stream) return -1;
 
     size_t frame_capacity = 300;
-    unsigned char *video_buffer = malloc(frame_capacity * (size_t)FRAME_SIZE);
+    uint8_t *video_buffer = malloc(frame_capacity * FRAME_SIZE);
     if (!video_buffer) {
         perror("malloc");
         close_process_pipe(&proc_pipe);
         return -1;
     }
 
-    size_t num_frames = 0;
-    while (keep_running && fread(&video_buffer[num_frames * FRAME_SIZE], sizeof(*video_buffer), FRAME_SIZE, proc_pipe.stream) == FRAME_SIZE) {
-        num_frames++;
+    unsigned int num_frames = 0;
+    while (keep_running) {
+        const size_t nread =
+            fread(&video_buffer[num_frames * FRAME_SIZE], sizeof(*video_buffer),
+                  FRAME_SIZE, proc_pipe.stream);
+        if (nread != FRAME_SIZE) break;
+
+        ++num_frames;
         if (num_frames >= frame_capacity) {
             frame_capacity *= 2;
-            unsigned char *new_buf = realloc(video_buffer, frame_capacity * FRAME_SIZE);
+            uint8_t *new_buf = realloc(video_buffer, frame_capacity * FRAME_SIZE);
             if (!new_buf) {
                 perror("realloc");
                 free(video_buffer);
@@ -452,44 +457,40 @@ static int display_video(const char *filepath, libusb_device_handle *dev)
     }
     close_process_pipe(&proc_pipe);
 
-    if (num_frames == 0) {
+    if (!num_frames) {
         (void)fprintf(stderr, "Error: No frames were read from the video stream.\n");
         free(video_buffer);
         return -1;
     }
 
     constexpr long second_ns = 1'000'000'000L;
-    const long frame_time_ns = (long)((double)second_ns / (double)frame_rate);
+    const long frame_time_ns = (long)(second_ns / frame_rate);
     struct timespec start, end;
 
     long frame_lag_ns = 0;
-    size_t current_frame = 0;
+    unsigned int current_frame = 0;
     while (keep_running) {
         clock_gettime(CLOCK_MONOTONIC, &start);
 
-        unsigned char *frame_ptr = &video_buffer[current_frame * (size_t)FRAME_SIZE];
+        uint8_t *frame_ptr = &video_buffer[current_frame * FRAME_SIZE];
         usb_send_header(dev);
         usb_send_data(frame_ptr, FRAME_SIZE, dev);
         current_frame = (current_frame + 1) % num_frames;
 
         clock_gettime(CLOCK_MONOTONIC, &end);
 
-        long elapsed_ns = (end.tv_sec - start.tv_sec) * second_ns + (end.tv_nsec - start.tv_nsec);
-        long remaining_ns = frame_time_ns - elapsed_ns - frame_lag_ns;
+        const long elapsed_ns = (end.tv_sec - start.tv_sec) * second_ns + (end.tv_nsec - start.tv_nsec);
+        const long remaining_ns = frame_time_ns - elapsed_ns - frame_lag_ns;
         if (remaining_ns > 0) {
-            struct timespec sleep = {
+            nanosleep(&(struct timespec){
                 .tv_sec = remaining_ns / second_ns,
                 .tv_nsec = remaining_ns % second_ns
-            };
-            nanosleep(&sleep, nullptr);
+            }, nullptr);
             frame_lag_ns = 0;
-        }
-        else {
+        } else {
             frame_lag_ns = -remaining_ns;
-            while (frame_lag_ns > frame_time_ns) {
-                current_frame = (current_frame + 1) % num_frames;
-                frame_lag_ns -= frame_time_ns;
-            }
+            current_frame = (unsigned int)((current_frame + frame_lag_ns / frame_time_ns) % num_frames);
+            frame_lag_ns %= frame_time_ns;
         }
     }
     free(video_buffer);
@@ -513,7 +514,7 @@ static void print_usage(FILE *stream, const char *argv0)
     );
 }
 
-int main(int argc, const char **argv)
+int main(const int argc, const char **argv)
 {
     struct sigaction signal = {
         .sa_handler = sig_handler,
@@ -524,14 +525,12 @@ int main(int argc, const char **argv)
     if (sigaction(SIGINT, &signal, nullptr) == -1 ||
         sigaction(SIGTERM, &signal, nullptr) == -1) {
         perror("sigaction");
-        return 1;
+        return EXIT_FAILURE;
     }
 
-    enum mode do_what = NOTHING;
-
-    struct commands {
-        const char *command;
-        enum mode mode;
+    const struct commands {
+        const char *const command;
+        const enum mode mode;
     } commands[] = {
         {"image", IMAGE},
         {"colour", COLOUR},
@@ -540,8 +539,10 @@ int main(int argc, const char **argv)
         {"help", PRINT_USAGE}
     };
 
+    enum mode do_what = NOTHING;
+
     if (argc > 1) {
-        for (uint32_t i = 0; i < countof(commands); i++) {
+        for (unsigned int i = 0; i < countof(commands); ++i) {
             if (strcmp(argv[1], commands[i].command) == 0) {
                 do_what = commands[i].mode;
                 break;
@@ -553,28 +554,28 @@ int main(int argc, const char **argv)
     libusb_device_handle *device = nullptr;
     if (do_what != NOTHING && do_what != PRINT_USAGE) {
         device = usb_init();
-        if (!device) return 1;
+        if (!device) return EXIT_FAILURE;
     }
 
     switch (do_what) {
         case IMAGE:
-            if (display_image(argc >= 3 ? argv[2] : nullptr, device) < 0) return 1;
-            return 0;
+            if (display_image(argc >= 3 ? argv[2] : nullptr, device) < 0) return EXIT_FAILURE;
+            return EXIT_SUCCESS;
         case COLOUR:
             if (argc < 3) {
                 print_usage(stderr, argv[0]);
-                return 1;
+                return EXIT_FAILURE;
             }
-            if (print_colour(argv[2], device) < 0) return 1;
-            return 0;
+            if (print_colour(argv[2], device) < 0) return EXIT_FAILURE;
+            return EXIT_SUCCESS;
         case VIDEO:
-            if (display_video(argc >= 3 ? argv[2] : nullptr, device) < 0) return 1;
-            return 0;
+            if (display_video(argc >= 3 ? argv[2] : nullptr, device) < 0) return EXIT_FAILURE;
+            return EXIT_SUCCESS;
         case NOTHING:
             print_usage(stderr, argv[0]);
-            return 1;
+            return EXIT_FAILURE;
         case PRINT_USAGE:
             print_usage(stdout, argv[0]);
-            return 0;
+            return EXIT_SUCCESS;
     }
 }
