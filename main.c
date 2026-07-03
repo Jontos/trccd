@@ -134,24 +134,25 @@ static int usb_send_data(uint8_t *data, const int length, libusb_device_handle *
 
 static int usb_send_header(libusb_device_handle *dev)
 {
-    struct [[gnu::packed]] header {
-        uint32_t magic;
-        uint32_t command;
-        uint16_t width;
-        uint16_t height;
-        uint32_t unknown;
-        uint32_t length;
-        uint8_t padding[492];
+    union header {
+        struct [[gnu::packed]] {
+            uint32_t magic;
+            uint32_t command;
+            uint16_t width;
+            uint16_t height;
+            uint32_t unknown;
+            uint32_t length;
+        };
+        uint8_t padding[PACKET_SIZE];
     };
 
-    return usb_send_data((uint8_t*)&(struct header){
+    return usb_send_data((uint8_t*)&(union header){
         .magic = 0xDDDCDBDA,
         .command = 0x00010002,
         .width = LCD_WIDTH,
         .height = LCD_HEIGHT,
         .unknown = 2,
-        .length = 512,
-        .padding = {}
+        .length = PACKET_SIZE
     }, PACKET_SIZE, dev);
 }
 
