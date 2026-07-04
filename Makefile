@@ -25,7 +25,7 @@ LDLIBS += $(shell pkg-config --libs $(packages))
 
 all: $(build_dir)/$(target)
 
-debug: CFLAGS = -Og -g $(warnings)
+debug: CFLAGS = -Og -g $(warnings) -fsanitize=address -fsanitize=undefined
 debug: $(build_dir)/$(target)
 
 $(build_dir)/$(target): $(objs)

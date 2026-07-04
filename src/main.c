@@ -14,9 +14,11 @@
 #include <linux/limits.h>
 
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 
 #include "usb.h"
+#include "cache.h"
 
 constexpr uint32_t NUM_PIXELS = LCD_HEIGHT * LCD_WIDTH;
 constexpr double MAX_FRAME_RATE = 22;
@@ -62,6 +64,7 @@ print_colour(const char *colour_str, libusb_device_handle *dev)
 }
 
 struct process_pipe {
+    int fd;
     FILE *stream;
     pid_t child_pid;
 };
@@ -69,7 +72,7 @@ struct process_pipe {
 static struct process_pipe
 fork_child_proc(const char *args[])
 {
-    struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
+    struct process_pipe proc_pipe = { .fd = -1, .child_pid = -1 };
 
     int fildes[2];
     if (pipe(fildes) < 0) {
@@ -82,7 +85,7 @@ fork_child_proc(const char *args[])
     const pid_t pid = fork();
     switch (pid) {
         case -1:
-            (void)fprintf(stderr, "Failed to fork %s: %s\n", args[READ_END],
+            (void)fprintf(stderr, "Failed to fork %s: %s\n", args[0],
                           strerror(errno));
             close(fildes[READ_END]);
             close(fildes[WRITE_END]);
@@ -91,12 +94,13 @@ fork_child_proc(const char *args[])
             close(fildes[READ_END]);
             dup2(fildes[WRITE_END], STDOUT_FILENO);
             close(fildes[WRITE_END]);
-            execvp(args[READ_END], (char *const *)args);
-            (void)fprintf(stderr, "Failed to exec %s: %s\n", args[READ_END],
+            execvp(args[0], (char *const *)args);
+            (void)fprintf(stderr, "Failed to exec %s: %s\n", args[0],
                           strerror(errno));
             _exit(EXIT_FAILURE);
         default:
             close(fildes[WRITE_END]);
+            proc_pipe.fd = fildes[READ_END];
             proc_pipe.stream = fdopen(fildes[READ_END], "r");
             if (!proc_pipe.stream) {
                 perror("Failed to open pipe for reading");
@@ -143,8 +147,6 @@ str_to_l(const char *nptr, char **endptr)
 static double
 probe_frame_rate(const char *filepath)
 {
-    if (!filepath) return MAX_FRAME_RATE;
-
     const char *args[] = {
         "ffprobe", 
         "-loglevel", "error",
@@ -191,7 +193,7 @@ enum mode { NOTHING, PRINT_USAGE, COLOUR, IMAGE, VIDEO };
 static struct process_pipe
 spawn_ffmpeg(const char *filepath, const enum mode mode, double *frame_rate)
 {
-    const struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
+    const struct process_pipe proc_pipe = { .fd = -1, .child_pid = -1 };
 
     char vf_str[256];
     char fps_str[32] = {};
@@ -245,7 +247,7 @@ spawn_ffmpeg(const char *filepath, const enum mode mode, double *frame_rate)
 static struct process_pipe
 open_pipe(const char *path_arg, const enum mode mode, double *frame_rate)
 {
-    struct process_pipe proc_pipe = { .stream = nullptr, .child_pid = -1 };
+    struct process_pipe proc_pipe = { .fd = -1, .child_pid = -1 };
 
     if (path_arg) {
         proc_pipe = spawn_ffmpeg(path_arg, mode, frame_rate);
@@ -254,6 +256,8 @@ open_pipe(const char *path_arg, const enum mode mode, double *frame_rate)
         }
     } else {
         proc_pipe.stream = stdin;
+        proc_pipe.fd = STDIN_FILENO;
+        *frame_rate = MAX_FRAME_RATE;
     }
 
     return proc_pipe;
@@ -284,69 +288,9 @@ display_image(const char *image, libusb_device_handle *dev)
     return usb_keep_alive(dev);
 }
 
-static char *
-generate_cache_file_template()
-{
-    char *template = nullptr;
-    const char *cache_dir = getenv("CACHE_DIRECTORY");
-    if (cache_dir) {
-        if (cache_dir[0] == '\0') {
-            (void)fprintf(stderr, "No cache directory set, does service file "
-                                  "contain `CacheDirectory=`?\n");
-            return nullptr;
-        }
-        if (asprintf(&template, "%s/XXXXXX", cache_dir) < 0) goto err;
-    } else {
-        cache_dir = getenv("XDG_CACHE_HOME");
-        if (!cache_dir || cache_dir[0] == '\0') {
-            const char *home_dir = getenv("HOME");
-            if (!home_dir || home_dir[0] == '\0') {
-                (void)fprintf(stderr, "Can't locate cache directory, "
-                                      "XDG_CACHE_HOME is empty or unset\n");
-                return nullptr;
-            }
-            if (asprintf(&template, "%s/.cache/XXXXXX", home_dir) < 0) goto err;
-        } else {
-            if (asprintf(&template, "%s/XXXXXX", cache_dir) < 0) goto err;
-        }
-    }
-
-    return template;
-err:
-    perror("Failed to allocate string for cache file!");
-
-    return nullptr;
-}
-
 // Cap video length to 24 hours
 constexpr unsigned int ONE_DAY_S = 24 * 60 * 60;
 constexpr size_t VIRT_MEM = FRAME_SIZE * (size_t)MAX_FRAME_RATE * ONE_DAY_S;
-
-static void *
-map_temp_file(int *const fd)
-{
-    char *template = generate_cache_file_template();
-    if (!template) return nullptr;
-
-    *fd = mkstemp(template);
-    if (*fd < 0) {
-        perror("mkstemp");
-        free(template);
-        return nullptr;
-    }
-    unlink(template);
-    free(template);
-
-    void *mapped_mem =
-        mmap(nullptr, VIRT_MEM, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (mapped_mem == MAP_FAILED) {
-        perror("Failed to create memory mapping!");
-        close(*fd);
-        return nullptr;
-    }
-
-    return mapped_mem;
-}
 
 struct thread_context {
     uint8_t *mem_buf;
@@ -358,7 +302,7 @@ struct thread_context {
 };
 
 struct reader_data {
-    const int mem_fd;
+    const int cache_fd;
     struct process_pipe *const proc_pipe;
 
     struct thread_context *const thread_ctx;
@@ -405,7 +349,7 @@ read_frames(void *userdata)
     unsigned int num_frames = 0;
     while (keep_running) {
         if (total_mem == file_capacity) {
-            const int mem_ret = grow_mapping(&file_capacity, data->mem_fd,
+            const int mem_ret = grow_mapping(&file_capacity, data->cache_fd,
                                              CHUNK_SIZE, ctx->mem_buf);
             if (mem_ret < 0) {
                 goto exit;
@@ -415,7 +359,7 @@ read_frames(void *userdata)
         }
 
         const size_t space_left = file_capacity - total_mem;
-        const ssize_t nread = splice(pipe_fd, nullptr, data->mem_fd, nullptr,
+        const ssize_t nread = splice(pipe_fd, nullptr, data->cache_fd, nullptr,
                                      space_left, SPLICE_F_MOVE);
         if (nread < 0) {
             perror("Failed to read data from ffmpeg!");
@@ -441,7 +385,7 @@ read_frames(void *userdata)
         goto exit;
     }
 
-    if (ftruncate(data->mem_fd, (off_t)total_mem) < 0) {
+    if (ftruncate(data->cache_fd, (off_t)total_mem) < 0) {
         perror("Failed to truncate temp file!");
     }
     if (total_mem < VIRT_MEM) {
@@ -465,16 +409,49 @@ exit:
 
 struct displayer_data {
     libusb_device_handle *dev;
+
+    uint8_t *cache_mem_buf;
+
+    bool cache_available;
+    unsigned int num_frames;
     const double frame_rate;
 
     struct thread_context *const thread_ctx;
 };
 
+static int
+check_prod_thread(struct displayer_data *const data,
+                  const unsigned int current_frame)
+{
+    struct thread_context *const ctx = data->thread_ctx;
+
+    pthread_mutex_lock(&ctx->mutex);
+
+    while (!ctx->finished_reading && current_frame == ctx->frames_written
+           && keep_running) {
+        pthread_cond_wait(&ctx->frames_ready, &ctx->mutex);
+    }
+
+    if (!ctx->frames_written && ctx->finished_reading) {
+        (void)fprintf(stderr, "No frames to read!\n");
+        pthread_mutex_unlock(&ctx->mutex);
+        return -1;
+    }
+
+    data->cache_available = ctx->finished_reading;
+    data->num_frames = ctx->frames_written;
+    pthread_mutex_unlock(&ctx->mutex);
+
+    return 0;
+}
+
 static void *
 display_frames(void *userdata)
 {
-    const struct displayer_data *const data = userdata;
-    struct thread_context *const ctx = data->thread_ctx;
+    struct displayer_data *const data = userdata;
+    uint8_t *frame_data = data->cache_available
+                        ? data->cache_mem_buf
+                        : data->thread_ctx->mem_buf;
 
     constexpr long second_ns = 1'000'000'000L;
     const long frame_time_ns = (long)(second_ns / data->frame_rate);
@@ -484,23 +461,12 @@ display_frames(void *userdata)
     void *err = (void*)(intptr_t)-1; // NOLINT(performance-no-int-to-ptr)
     long frame_lag_ns = 0;
     unsigned int current_frame = 0;
-    unsigned int num_frames = 0;
     while (keep_running) {
-        pthread_mutex_lock(&ctx->mutex);
-
-        while (!ctx->finished_reading && current_frame == ctx->frames_written &&
-               keep_running) {
-            pthread_cond_wait(&ctx->frames_ready, &ctx->mutex);
+        if (!data->cache_available) {
+            if (check_prod_thread(data, current_frame) < 0) {
+                return err;
+            }
         }
-
-        if (ctx->finished_reading && !ctx->frames_written) {
-            (void)fprintf(stderr, "No frames to read!\n");
-            pthread_mutex_unlock(&ctx->mutex);
-            return (void*)(intptr_t)-1; // NOLINT(performance-no-int-to-ptr)
-        }
-        num_frames = ctx->frames_written;
-
-        pthread_mutex_unlock(&ctx->mutex);
 
         unsigned int retries = NUM_RETRIES;
         clock_gettime(CLOCK_MONOTONIC, &start);
@@ -513,7 +479,7 @@ display_frames(void *userdata)
         }
         retries = NUM_RETRIES;
 
-        uint8_t *frame_ptr = &ctx->mem_buf[current_frame * FRAME_SIZE];
+        uint8_t *frame_ptr = &frame_data[current_frame * FRAME_SIZE];
         while (usb_send_data(frame_ptr, FRAME_SIZE, data->dev) < 0
                && keep_running) {
             if (--retries == 0) {
@@ -521,7 +487,8 @@ display_frames(void *userdata)
                 return err;
             }
         }
-        current_frame = (current_frame + 1) % num_frames;
+        ++current_frame;
+        if (data->cache_available) current_frame %= data->num_frames;
 
         clock_gettime(CLOCK_MONOTONIC, &end);
 
@@ -538,7 +505,7 @@ display_frames(void *userdata)
             frame_lag_ns = -remaining_ns;
             current_frame =
                 (unsigned int)((current_frame + frame_lag_ns / frame_time_ns)
-                               % num_frames);
+                               % data->num_frames);
             frame_lag_ns %= frame_time_ns;
         }
     }
@@ -547,15 +514,22 @@ display_frames(void *userdata)
 }
 
 static int
-display_video(const char *filepath, libusb_device_handle *dev)
+play_non_cached(const char *const filepath, const int dir_fd,
+                libusb_device_handle *dev, const bool enable_caching)
 {
-    double frame_rate = MAX_FRAME_RATE;
+    double frame_rate;
     struct process_pipe proc_pipe = open_pipe(filepath, VIDEO, &frame_rate);
     if (!proc_pipe.stream) return -1;
 
-    int mem_fd;
-    struct thread_context thread_ctx = { .mem_buf = map_temp_file(&mem_fd) };
-    if (!thread_ctx.mem_buf) return -1;
+    struct thread_context thread_ctx = {
+        .mem_buf = mmap(nullptr, VIRT_MEM, PROT_NONE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+    };
+    if (thread_ctx.mem_buf == MAP_FAILED) {
+        perror("Failed to create memory mapping!");
+        close_process_pipe(&proc_pipe);
+        return -1;
+    }
 
     pthread_mutex_init(&thread_ctx.mutex, nullptr);
     pthread_cond_init(&thread_ctx.frames_ready, nullptr);
@@ -564,10 +538,17 @@ display_video(const char *filepath, libusb_device_handle *dev)
     bool cons_created = false;
     pthread_t prod_tid, cons_tid;
 
+    const int cache_fd =
+        openat(dir_fd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
+    if (cache_fd < 0) {
+        perror("Failed to open temporary cache file");
+        return -1;
+    }
+
     int ret = pthread_create(
         &prod_tid, nullptr, read_frames,
         &(struct reader_data){
-            .mem_fd = mem_fd,
+            .cache_fd = cache_fd,
             .proc_pipe = &proc_pipe,
             .thread_ctx = &thread_ctx
         }
@@ -583,10 +564,9 @@ display_video(const char *filepath, libusb_device_handle *dev)
             .thread_ctx = &thread_ctx
         }
     );
-    if (ret != 0) goto cleanup;
-    cons_created = true;
-
+    if (ret == 0) cons_created = true;
 cleanup:
+
     if (ret != 0) {
         (void)fprintf(stderr, "Failed to create thread: %s\n", strerror(ret));
         keep_running = false;
@@ -598,6 +578,9 @@ cleanup:
     if (prod_created) {
         pthread_join(prod_tid, &res);
         prod_ret = (int)(intptr_t)res;
+        if (prod_ret == 0 && enable_caching) {
+            cache_save(dir_fd, cache_fd, filepath, frame_rate);
+        }
         if (cons_created) {
             pthread_join(cons_tid, &res);
             cons_ret = (int)(intptr_t)res;
@@ -606,12 +589,75 @@ cleanup:
         close_process_pipe(&proc_pipe);
     }
 
+    close(cache_fd);
+
     pthread_cond_destroy(&thread_ctx.frames_ready);
     pthread_mutex_destroy(&thread_ctx.mutex);
 
     if (ret || prod_ret || cons_ret) return -1;
 
     return 0;
+}
+
+static int
+play_cached(libusb_device_handle *const dev, uint8_t *const cached_mem,
+            const size_t size, const double frame_rate)
+{
+    if (size < FRAME_SIZE) return -1;
+
+    return (int)(intptr_t)display_frames(&(struct displayer_data){
+        .dev = dev,
+        .cache_mem_buf = cached_mem,
+        .cache_available = true,
+        .num_frames = (unsigned int)(size / FRAME_SIZE),
+        .frame_rate = frame_rate
+    });
+}
+
+static void
+close_cache_dir(const struct cache_dir *const cache_dir)
+{
+    if (cache_dir->fd >= 0) close(cache_dir->fd);
+}
+
+static int
+display_video(const char *filepath, libusb_device_handle *dev)
+{
+    [[gnu::cleanup(close_cache_dir)]]
+    const struct cache_dir cache_dir = cache_open_dir();
+    if (cache_dir.fd < 0) return -1;
+
+    if (!filepath) {
+        struct stat statbuf;
+        if (fstat(STDIN_FILENO, &statbuf) < 0) {
+            perror("Failed to stat redirected file");
+            return -1;
+        }
+
+        if ((statbuf.st_mode & S_IFMT) == S_IFREG) {
+            void *mem_buf = mmap(nullptr, (size_t)statbuf.st_size, PROT_READ,
+                                 MAP_PRIVATE, STDIN_FILENO, 0);
+            if (mem_buf == MAP_FAILED) {
+                perror("Failed to map file redirection into memory");
+                return -1;
+            }
+
+            return play_cached(dev, mem_buf, (size_t)statbuf.st_size, MAX_FRAME_RATE);
+        }
+
+        return play_non_cached(filepath, cache_dir.fd, dev, false);
+    }
+
+    double frame_rate;
+    if (cache_exists(cache_dir.fd) && cache_valid(cache_dir.fd, filepath, &frame_rate)) {
+        size_t size;
+        uint8_t *cached_mem = cache_open_file(cache_dir.fd, &size);
+        if (cached_mem) {
+            return play_cached(dev, cached_mem, size, frame_rate);
+        }
+    }
+
+    return play_non_cached(filepath, cache_dir.fd, dev, cache_dir.persistent);
 }
 
 static void
@@ -631,8 +677,7 @@ print_usage(FILE *stream, const char *argv0)
     );
 }
 
-int
-main(const int argc, const char **argv)
+int main(const int argc, const char **argv)
 {
     struct sigaction signal = {
         .sa_handler = sig_handler,
