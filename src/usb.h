@@ -12,7 +12,6 @@ libusb_device_handle *usb_init();
 
 int usb_send_data(uint8_t *data, int length, libusb_device_handle *dev);
 int usb_send_header(libusb_device_handle *dev);
-int usb_keep_alive(libusb_device_handle *dev);
 
 void usb_release(libusb_device_handle **dev);
 

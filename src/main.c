@@ -2,6 +2,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdcountof.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -10,8 +11,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
-#include <linux/limits.h>
 
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -25,12 +24,95 @@ constexpr double MAX_FRAME_RATE = 22;
 
 constexpr size_t FRAME_SIZE = NUM_PIXELS * sizeof(uint16_t);
 
-volatile sig_atomic_t keep_running = true;
+constexpr long SECOND_NS = 1'000'000'000L;
 
-static void
-sig_handler(int signum)
+atomic_bool keep_running = true;
+
+struct thread_cond {
+    pthread_mutex_t mutex;
+    pthread_cond_t cond;
+};
+
+static struct {
+    pthread_mutex_t mutex;
+    struct thread_cond *active_thread;
+} thread_tracker = { .mutex = PTHREAD_MUTEX_INITIALIZER };
+
+static struct {
+    pthread_mutex_t mutex;
+    pid_t pid;
+} proc_tracker = { .mutex = PTHREAD_MUTEX_INITIALIZER, .pid = -1 };
+
+static void *
+sig_thread(void *arg)
 {
-    if (signum == SIGINT || signum == SIGTERM) keep_running = false;
+    sigwait((sigset_t*)arg, &(int){});
+    keep_running = false;
+
+    pthread_mutex_lock(&thread_tracker.mutex);
+    if (thread_tracker.active_thread) {
+        pthread_mutex_lock(&thread_tracker.active_thread->mutex);
+        pthread_cond_signal(&thread_tracker.active_thread->cond);
+        pthread_mutex_unlock(&thread_tracker.active_thread->mutex);
+    }
+    pthread_mutex_unlock(&thread_tracker.mutex);
+
+    pthread_mutex_lock(&proc_tracker.mutex);
+    if (proc_tracker.pid > 0) kill(proc_tracker.pid, SIGTERM);
+    pthread_mutex_unlock(&proc_tracker.mutex);
+
+    sigwait((sigset_t*)arg, &(int){});
+    _exit(EXIT_FAILURE);
+}
+
+static int
+keep_alive(libusb_device_handle *dev)
+{
+    struct thread_cond sig_received;
+    pthread_mutex_init(&sig_received.mutex, nullptr);
+
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&sig_received.cond, &attr);
+
+    pthread_mutex_lock(&thread_tracker.mutex);
+    thread_tracker.active_thread = &sig_received;
+    pthread_mutex_unlock(&thread_tracker.mutex);
+
+    int ret = 0;
+    while (keep_running) {
+        if (usb_send_data((uint8_t[PACKET_SIZE]){}, PACKET_SIZE, dev) < 0) {
+            ret = -1;
+            break;
+        }
+
+        // 2.5s is the longest interval between transfers that still keeps the
+        // connection alive
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        constexpr long half_second_ns = SECOND_NS / 2;
+        long ns = ts.tv_nsec + half_second_ns;
+        int overflow = ns >= SECOND_NS;
+        ts.tv_sec += 2 + overflow;
+        ts.tv_nsec = ns - (overflow * SECOND_NS);
+
+        pthread_mutex_lock(&sig_received.mutex);
+        if (keep_running) {
+            pthread_cond_timedwait(&sig_received.cond, &sig_received.mutex, &ts);
+        }
+        pthread_mutex_unlock(&sig_received.mutex);
+    }
+
+    pthread_mutex_lock(&thread_tracker.mutex);
+    thread_tracker.active_thread = nullptr;
+    pthread_mutex_unlock(&thread_tracker.mutex);
+
+    pthread_condattr_destroy(&attr);
+    pthread_cond_destroy(&sig_received.cond);
+    pthread_mutex_destroy(&sig_received.mutex);
+
+    return ret;
 }
 
 static int
@@ -60,7 +142,7 @@ print_colour(const char *colour_str, libusb_device_handle *dev)
         return -1;
     }
 
-    return usb_keep_alive(dev);
+    return keep_alive(dev);
 }
 
 struct process_pipe {
@@ -94,6 +176,9 @@ fork_child_proc(const char *args[])
             close(fildes[READ_END]);
             dup2(fildes[WRITE_END], STDOUT_FILENO);
             close(fildes[WRITE_END]);
+            sigset_t empty;
+            sigemptyset(&empty);
+            pthread_sigmask(SIG_SETMASK, &empty, nullptr);
             execvp(args[0], (char *const *)args);
             (void)fprintf(stderr, "Failed to exec %s: %s\n", args[0],
                           strerror(errno));
@@ -109,6 +194,9 @@ fork_child_proc(const char *args[])
                 break;
             }
             proc_pipe.child_pid = pid;
+            pthread_mutex_lock(&proc_tracker.mutex);
+            proc_tracker.pid = pid;
+            pthread_mutex_unlock(&proc_tracker.mutex);
     }
 
     return proc_pipe;
@@ -125,6 +213,9 @@ close_process_pipe(struct process_pipe *const proc_pipe)
     }
 
     if (proc_pipe->child_pid > 0) {
+        pthread_mutex_lock(&proc_tracker.mutex);
+        proc_tracker.pid = -1;
+        pthread_mutex_unlock(&proc_tracker.mutex);
         waitpid(proc_pipe->child_pid, nullptr, 0);
         proc_pipe->child_pid = -1;
     }
@@ -285,7 +376,7 @@ display_image(const char *image, libusb_device_handle *dev)
     usb_send_header(dev);
     usb_send_data(frame_buffer, FRAME_SIZE, dev);
 
-    return usb_keep_alive(dev);
+    return keep_alive(dev);
 }
 
 // Cap video length to 24 hours
@@ -297,8 +388,7 @@ struct thread_context {
     unsigned int frames_written;
     bool finished_reading;
 
-    pthread_mutex_t mutex;
-    pthread_cond_t frames_ready;
+    struct thread_cond frames_ready;
 };
 
 struct reader_data {
@@ -372,10 +462,10 @@ read_frames(void *userdata)
         if (nread == 0) break;
 
         if (num_frames > ctx->frames_written) {
-            pthread_mutex_lock(&ctx->mutex);
+            pthread_mutex_lock(&ctx->frames_ready.mutex);
             ctx->frames_written = num_frames;
-            pthread_cond_signal(&ctx->frames_ready);
-            pthread_mutex_unlock(&ctx->mutex);
+            pthread_cond_signal(&ctx->frames_ready.cond);
+            pthread_mutex_unlock(&ctx->frames_ready.mutex);
         }
     }
 
@@ -395,14 +485,13 @@ read_frames(void *userdata)
             perror("Failed to unmap excess overlay memory!");
         }
     }
-
 exit:
     close_process_pipe(data->proc_pipe);
 
-    pthread_mutex_lock(&ctx->mutex);
+    pthread_mutex_lock(&ctx->frames_ready.mutex);
     ctx->finished_reading = true;
-    pthread_cond_signal(&ctx->frames_ready);
-    pthread_mutex_unlock(&ctx->mutex);
+    pthread_cond_signal(&ctx->frames_ready.cond);
+    pthread_mutex_unlock(&ctx->frames_ready.mutex);
 
     return ret;
 }
@@ -425,24 +514,50 @@ check_prod_thread(struct displayer_data *const data,
 {
     struct thread_context *const ctx = data->thread_ctx;
 
-    pthread_mutex_lock(&ctx->mutex);
+    pthread_mutex_lock(&ctx->frames_ready.mutex);
 
     while (!ctx->finished_reading && current_frame == ctx->frames_written
            && keep_running) {
-        pthread_cond_wait(&ctx->frames_ready, &ctx->mutex);
+        pthread_cond_wait(&ctx->frames_ready.cond, &ctx->frames_ready.mutex);
     }
 
     if (!ctx->frames_written && ctx->finished_reading) {
         (void)fprintf(stderr, "No frames to read!\n");
-        pthread_mutex_unlock(&ctx->mutex);
+        pthread_mutex_unlock(&ctx->frames_ready.mutex);
         return -1;
     }
 
     data->cache_available = ctx->finished_reading;
     data->num_frames = ctx->frames_written;
-    pthread_mutex_unlock(&ctx->mutex);
+    pthread_mutex_unlock(&ctx->frames_ready.mutex);
 
     return 0;
+}
+
+static void
+pace_frames(const struct timespec *start, const struct timespec *end,
+            const long frame_time, long *frame_lag, unsigned int *current_frame,
+            const unsigned int num_frames)
+{
+    const long elapsed_ns = (end->tv_sec - start->tv_sec) * SECOND_NS
+                          + (end->tv_nsec - start->tv_nsec);
+    const long remaining_ns = frame_time - elapsed_ns - *frame_lag;
+
+    if (remaining_ns > 0) {
+        nanosleep(
+            &(struct timespec){
+                .tv_sec = remaining_ns / SECOND_NS,
+                .tv_nsec = remaining_ns % SECOND_NS
+            },
+            nullptr);
+        *frame_lag = 0;
+    } else {
+        *frame_lag = -remaining_ns;
+        *current_frame =
+            (unsigned int)((*current_frame + *frame_lag / frame_time)
+                           % num_frames);
+        *frame_lag %= frame_time;
+    }
 }
 
 static void *
@@ -453,8 +568,7 @@ display_frames(void *userdata)
                         ? data->cache_mem_buf
                         : data->thread_ctx->mem_buf;
 
-    constexpr long second_ns = 1'000'000'000L;
-    const long frame_time_ns = (long)(second_ns / data->frame_rate);
+    const long frame_time_ns = (long)(SECOND_NS / data->frame_rate);
     struct timespec start, end;
     constexpr unsigned int NUM_RETRIES = 10;
 
@@ -466,6 +580,7 @@ display_frames(void *userdata)
             if (check_prod_thread(data, current_frame) < 0) {
                 return err;
             }
+            if (!keep_running) break;
         }
 
         unsigned int retries = NUM_RETRIES;
@@ -492,22 +607,8 @@ display_frames(void *userdata)
 
         clock_gettime(CLOCK_MONOTONIC, &end);
 
-        const long elapsed_ns = (end.tv_sec - start.tv_sec) * second_ns
-                                + (end.tv_nsec - start.tv_nsec);
-        const long remaining_ns = frame_time_ns - elapsed_ns - frame_lag_ns;
-        if (remaining_ns > 0) {
-            nanosleep(&(struct timespec){
-                .tv_sec = remaining_ns / second_ns,
-                .tv_nsec = remaining_ns % second_ns
-            }, nullptr);
-            frame_lag_ns = 0;
-        } else {
-            frame_lag_ns = -remaining_ns;
-            current_frame =
-                (unsigned int)((current_frame + frame_lag_ns / frame_time_ns)
-                               % data->num_frames);
-            frame_lag_ns %= frame_time_ns;
-        }
+        pace_frames(&start, &end, frame_time_ns, &frame_lag_ns, &current_frame,
+                    data->num_frames);
     }
 
     return nullptr;
@@ -531,19 +632,23 @@ play_non_cached(const char *const filepath, const int dir_fd,
         return -1;
     }
 
-    pthread_mutex_init(&thread_ctx.mutex, nullptr);
-    pthread_cond_init(&thread_ctx.frames_ready, nullptr);
-
-    bool prod_created = false;
-    bool cons_created = false;
-    pthread_t prod_tid, cons_tid;
-
     const int cache_fd =
         openat(dir_fd, ".", O_TMPFILE | O_RDWR | O_CLOEXEC, S_IRUSR | S_IWUSR);
     if (cache_fd < 0) {
         perror("Failed to open temporary cache file");
         return -1;
     }
+
+    pthread_mutex_init(&thread_ctx.frames_ready.mutex, nullptr);
+    pthread_cond_init(&thread_ctx.frames_ready.cond, nullptr);
+
+    pthread_mutex_lock(&thread_tracker.mutex);
+    thread_tracker.active_thread = &thread_ctx.frames_ready;
+    pthread_mutex_unlock(&thread_tracker.mutex);
+
+    bool prod_created = false;
+    bool cons_created = false;
+    pthread_t prod_tid, cons_tid;
 
     int ret = pthread_create(
         &prod_tid, nullptr, read_frames,
@@ -591,8 +696,12 @@ cleanup:
 
     close(cache_fd);
 
-    pthread_cond_destroy(&thread_ctx.frames_ready);
-    pthread_mutex_destroy(&thread_ctx.mutex);
+    pthread_mutex_lock(&thread_tracker.mutex);
+    thread_tracker.active_thread = nullptr;
+    pthread_mutex_unlock(&thread_tracker.mutex);
+
+    pthread_cond_destroy(&thread_ctx.frames_ready.cond);
+    pthread_mutex_destroy(&thread_ctx.frames_ready.mutex);
 
     if (ret || prod_ret || cons_ret) return -1;
 
@@ -660,6 +769,35 @@ display_video(const char *filepath, libusb_device_handle *dev)
     return play_non_cached(filepath, cache_dir.fd, dev, cache_dir.persistent);
 }
 
+static int
+init_signal_handling()
+{
+    static sigset_t set;
+    sigemptyset(&set);
+    sigaddset(&set, SIGINT);
+    sigaddset(&set, SIGTERM);
+
+    int ret = pthread_sigmask(SIG_BLOCK, &set, nullptr);
+    if (ret != 0) {
+        (void)fprintf(stderr, "Failed to set signal mask: %s\n", strerror(ret));
+        return -1;
+    }
+
+    pthread_t thread;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    ret = pthread_create(&thread, &attr, &sig_thread, &set);
+    if (ret != 0) {
+        (void)fprintf(stderr, "Failed to create signal handler thread: %s\n",
+                      strerror(ret));
+        return -1;
+    }
+    pthread_attr_destroy(&attr);
+
+    return 0;
+}
+
 static void
 print_usage(FILE *stream, const char *argv0)
 {
@@ -679,17 +817,7 @@ print_usage(FILE *stream, const char *argv0)
 
 int main(const int argc, const char **argv)
 {
-    struct sigaction signal = {
-        .sa_handler = sig_handler,
-        .sa_flags = SA_RESTART
-    };
-    sigemptyset(&signal.sa_mask);
-
-    if (sigaction(SIGINT, &signal, nullptr) == -1
-        || sigaction(SIGTERM, &signal, nullptr) == -1) {
-        perror("sigaction");
-        return EXIT_FAILURE;
-    }
+    if (init_signal_handling() < 0) return EXIT_FAILURE;
 
     const struct commands {
         const char *const command;

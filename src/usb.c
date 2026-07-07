@@ -1,4 +1,4 @@
-#include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 
 #include "usb.h"
@@ -136,23 +136,4 @@ int usb_send_header(libusb_device_handle *dev)
             .length = PACKET_SIZE
         },
     PACKET_SIZE, dev);
-}
-
-extern volatile sig_atomic_t keep_running;
-
-int usb_keep_alive(libusb_device_handle *dev)
-{
-    while (keep_running) {
-        if (usb_send_data((uint8_t[PACKET_SIZE]){}, PACKET_SIZE, dev) < 0) {
-            return -1;
-        }
-        // 2.5s is the longest interval between transfers that still keeps the
-        // connection alive
-        nanosleep(&(struct timespec){
-            .tv_nsec = 500000000,
-            .tv_sec = 2
-        }, nullptr);
-    }
-
-    return 0;
 }
