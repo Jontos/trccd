@@ -10,6 +10,10 @@ srcs = $(wildcard $(src_dir)/*.c)
 objs = $(srcs:$(src_dir)/%.c=$(build_dir)/%.o)
 deps = $(objs:.o=.d)
 
+test_dir = tests
+test_srcs = $(wildcard $(test_dir)/*.c)
+test_bins = $(test_srcs:$(test_dir)/%.c=$(build_dir)/%)
+
 prefix ?= /usr/local
 exec_prefix ?= $(prefix)
 bindir ?= $(exec_prefix)/bin
@@ -30,7 +34,7 @@ CPPFLAGS += -MMD -MP -D_GNU_SOURCE
 LDFLAGS += -pthread $(sanitize)
 LDLIBS += $(shell pkg-config --libs $(packages))
 
-.PHONY: all clean debug install
+.PHONY: all debug check run-checks install clean
 .DELETE_ON_ERROR:
 
 all: $(build_dir)/$(target)
@@ -38,8 +42,17 @@ all: $(build_dir)/$(target)
 debug:
 	@$(MAKE) config=debug
 
+check:
+	@$(MAKE) config=debug run-checks
+
+run-checks: $(test_bins)
+	@for t in $^; do ./$$t || exit 1; done
+
 $(build_dir)/$(target): $(objs)
 	$(CC) $(LDFLAGS) $^ -o $@ $(LDLIBS)
+
+$(build_dir)/test_%: $(test_dir)/test_%.c $(build_dir)/%.o | $(build_dir)
+	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) $(LDFLAGS) $^ -o $@
 
 $(build_dir)/%.o: $(src_dir)/%.c | $(build_dir)
 	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) -c $< -o $@
