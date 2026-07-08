@@ -1,9 +1,12 @@
 target = trccd
 packages = libusb-1.0
 
+config ?= release
 src_dir = src
+build_root = build
+build_dir = $(build_root)/$(config)
+
 srcs = $(wildcard $(src_dir)/*.c)
-build_dir = build
 objs = $(srcs:$(src_dir)/%.c=$(build_dir)/%.o)
 deps = $(objs:.o=.d)
 
@@ -14,10 +17,17 @@ libdir ?= $(exec_prefix)/lib
 sysconfdir ?= $(prefix)/etc
 
 warnings = -Wall -Wextra
+
+ifeq ($(config),debug)
+CFLAGS = -Og -g $(warnings)
+sanitize = -fsanitize=address,undefined
+else
 CFLAGS ?= -O2 $(warnings)
-ALL_CFLAGS = -std=gnu23 -pthread $(shell pkg-config --cflags $(packages)) $(CFLAGS)
+endif
+
+ALL_CFLAGS = -std=gnu23 -pthread $(shell pkg-config --cflags $(packages)) $(sanitize) $(CFLAGS)
 CPPFLAGS += -MMD -MP -D_GNU_SOURCE
-LDFLAGS += -pthread
+LDFLAGS += -pthread $(sanitize)
 LDLIBS += $(shell pkg-config --libs $(packages))
 
 .PHONY: all clean debug install
@@ -25,11 +35,11 @@ LDLIBS += $(shell pkg-config --libs $(packages))
 
 all: $(build_dir)/$(target)
 
-debug: CFLAGS = -Og -g $(warnings) -fsanitize=address -fsanitize=undefined
-debug: $(build_dir)/$(target)
+debug:
+	@$(MAKE) config=debug
 
 $(build_dir)/$(target): $(objs)
-	$(CC) $(LDFLAGS) $(ALL_CFLAGS) $^ -o $@ $(LDLIBS)
+	$(CC) $(LDFLAGS) $^ -o $@ $(LDLIBS)
 
 $(build_dir)/%.o: $(src_dir)/%.c | $(build_dir)
 	$(CC) $(CPPFLAGS) $(ALL_CFLAGS) -c $< -o $@
@@ -48,4 +58,4 @@ install: $(build_dir)/$(target)
 	install -Dm644 trccd.conf $(DESTDIR)$(sysconfdir)/trccd/trccd.conf
 
 clean:
-	rm -rf $(build_dir)
+	rm -rf $(build_root)
